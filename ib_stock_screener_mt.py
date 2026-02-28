@@ -1,17 +1,29 @@
 """
-美股筛选器 v4（多线程 + fundamentalRatios 精确解析）
-基于实测确认的 IB fundamentalRatios 字段：
+美股筛选器 v6（多线程 + fundamentalRatios 精确解析）
 
-  Forward PE  = NPRICE / AFEEPSNTM   (NTM预期EPS)
-  净现金判断  = NetDebt_I < 0        (NetDebt_I 单位：百万，负值=净现金为正)
+字段货币说明（经 PDD/BABA/AAPL 实测验证）：
+  TTMEPSXCLX — TTM EPS，IB 已统一换算为 USD  ✅ 直接用
+  AEPSNORM   — 标准化年度 EPS，IB 已换算 USD  ✅ 直接用
+  AFEEPSNTM  — 分析师预期 EPS，原始本地货币  ❌ 不可直接用（中概股为人民币）
+  PEEXCLXOR  — IB 直接算好的 TTM PE（货币已对齐） ✅ 最可靠，用作兜底
+  NPRICE     — 最新股价（USD）
+  NetDebt_I  — 净债务百万（负值=净现金为正）
+  CURRENCY   — 仅为标注字段，所有计算字段已统一为 USD
+
+验证：
+  PDD:  NPRICE=105.39 / TTMEPSXCLX=10.075 = 10.46 = PEEXCLXOR ✅
+  AAPL: NPRICE=272.95 / TTMEPSXCLX=7.871  = 34.67 = PEEXCLXOR ✅
+
+Forward PE 计算优先级：
+  1. NPRICE / TTMEPSXCLX   （TTM实际，USD已对齐）
+  2. NPRICE / AEPSNORM     （标准化，USD已对齐）
+  3. PEEXCLXOR             （IB直接，兜底）
 
 筛选条件：
-  1. Forward PE (NPRICE / AFEEPSNTM) < 20
-  2. NetDebt_I < 0  (即净现金 > 总债务)
-  3. 股票列表从 tickers.txt 读取
+  1. Forward PE < 20
+  2. NetDebt_I < 0（净现金 > 总债务）
 
 依赖：pip install ib_insync pandas tqdm
-前提：TWS/Gateway 已运行，已有基础行情订阅（无需 Reuters Fundamentals）
 """
 
 import asyncio
@@ -19,7 +31,7 @@ import time
 import queue
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import pandas as pd
@@ -28,7 +40,7 @@ from ib_insync import IB, Stock
 
 # ─── 配置 ──────────────────────────────────────────────────────────────────────
 IB_HOST        = "127.0.0.1"
-IB_PORT        = 4001          # 模拟 7497 | 实盘 7496 | Gateway 4002
+IB_PORT        = 4001
 BASE_CLIENT_ID = 10
 
 TICKER_FILE    = "all_tickers.txt"
@@ -36,9 +48,10 @@ EXCHANGE       = "SMART"
 CURRENCY       = "USD"
 
 FORWARD_PE_MAX = 20.0
-NUM_WORKERS    = 8            # 并发线程数（每个线程一个 IB 连接）
-MKT_DATA_WAIT  = 4.0           # reqMktData 等待时间（秒），太短会拿不到数据
-REQUEST_DELAY  = 0.5           # 每次请求后冷却
+NUM_WORKERS    = 10
+MKT_DATA_WAIT  = 4.0    # reqMktData 推送等待（秒）
+FX_WAIT        = 3.0    # Forex 汇率请求等待（秒）
+REQUEST_DELAY  = 0.5
 MAX_RETRY      = 2
 RETRY_DELAY    = 3.0
 
@@ -51,6 +64,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
 
 
 # ─── 全局令牌桶 ─────────────────────────────────────────────────────────────────
@@ -79,60 +94,76 @@ _limiter = TokenBucket(rate=NUM_WORKERS * 1.2, capacity=NUM_WORKERS * 2)
 # ─── 数据结构 ───────────────────────────────────────────────────────────────────
 @dataclass
 class StockResult:
-    ticker       : str
-    company      : str             = ""
-    forward_pe   : Optional[float] = None   # NPRICE / AFEEPSNTM
-    ntm_eps      : Optional[float] = None   # AFEEPSNTM
-    price        : Optional[float] = None   # NPRICE
-    net_debt_m   : Optional[float] = None   # NetDebt_I（负=净现金）
-    net_cash_m   : Optional[float] = None   # -NetDebt_I
-    mktcap_m     : Optional[float] = None   # MKTCAP
-    pe_ttm       : Optional[float] = None   # PEEXCLXOR（仅供参考）
-    status       : str             = "pending"
-    reason       : str             = ""
+    ticker     : str
+    forward_pe : Optional[float] = None   # NPRICE / TTMEPSXCLX（USD已对齐）
+    pe_src     : str             = ""     # TTM / NORM / PEEXCLXOR(兜底)
+    ttm_eps    : Optional[float] = None   # TTMEPSXCLX（USD）
+    price      : Optional[float] = None   # NPRICE（USD）
+    net_debt_m : Optional[float] = None   # NetDebt_I（百万，负=净现金）
+    net_cash_m : Optional[float] = None   # -NetDebt_I
+    mktcap_m   : Optional[float] = None   # MKTCAP（百万）
+    pe_ttm_ib  : Optional[float] = None   # PEEXCLXOR（IB直接算，供校验）
+    status     : str             = "pending"
+    reason     : str             = ""
 
 
-# ─── fundamentalRatios 解析 ─────────────────────────────────────────────────────
+# ─── fundamentalRatios 解析 + PE 计算 ──────────────────────────────────────────
 def parse_fr(fr) -> Optional[dict]:
     """
-    从 FundamentalRatios 对象提取所需字段。
-    实测可用字段（来自 AAPL）：
-      AFEEPSNTM  — NTM 预期 EPS（Forward EPS，分析师共识）
-      NPRICE     — 最新价格
-      NetDebt_I  — 净债务（百万，负值表示净现金为正）
-      PEEXCLXOR  — TTM PE（排除特殊项）
-      MKTCAP     — 市值（百万）
+    解析 FundamentalRatios。
+    所有 IB 计算字段（TTMEPSXCLX、AEPSNORM、PEEXCLXOR）已统一为 USD，直接使用。
+    AFEEPSNTM 为原始本地货币（中概股是人民币），不参与计算。
     """
     if fr is None:
         return None
 
     def g(attr):
-        """安全取属性，-1 视为无效"""
+        """取正浮点，-1 和 0.0 视为无效（IB 填充值）"""
         v = getattr(fr, attr, None)
-        if v is None or v == -1:
+        if v is None:
             return None
         try:
-            return float(v)
+            f = float(v)
+            return None if f in (-1.0, 0.0) else f
         except (TypeError, ValueError):
             return None
 
-    ntm_eps  = g("AFEEPSNTM")
-    price    = g("NPRICE")
-    net_debt = g("NetDebt_I")   # 百万，负=净现金 > 0
+    def g0(attr):
+        """取浮点，允许 0.0（NetDebt=0 合法）"""
+        v = getattr(fr, attr, None)
+        if v is None:
+            return None
+        try:
+            f = float(v)
+            return None if f == -1.0 else f
+        except (TypeError, ValueError):
+            return None
 
-    # Forward PE 计算
-    forward_pe = None
-    if price and ntm_eps and ntm_eps > 0:
-        forward_pe = round(price / ntm_eps, 2)
+    price    = g("NPRICE")          # USD
+    ttm_eps  = g("TTMEPSXCLX")     # USD（IB已换算）✅
+    norm_eps = g("AEPSNORM")       # USD（IB已换算）✅
+    pe_ib    = g0("PEEXCLXOR")     # IB直接算的TTM PE，货币已对齐 ✅
+
+    # Forward PE 优先级：
+    #   1. NPRICE / TTMEPSXCLX  — TTM实际盈利，USD，最准
+    #   2. NPRICE / AEPSNORM    — 标准化盈利，USD
+    #   3. PEEXCLXOR            — IB直接，兜底
+    forward_pe, pe_src = None, ""
+    if price and ttm_eps and ttm_eps > 0:
+        forward_pe, pe_src = round(price / ttm_eps, 2), "TTM"
+    elif price and norm_eps and norm_eps > 0:
+        forward_pe, pe_src = round(price / norm_eps, 2), "NORM"
+    elif pe_ib and pe_ib > 0:
+        forward_pe, pe_src = round(pe_ib, 2), "PEEXCLXOR(兜底)"
 
     return dict(
         forward_pe = forward_pe,
-        ntm_eps    = ntm_eps,
+        pe_src     = pe_src,
+        ttm_eps    = ttm_eps,
         price      = price,
-        net_debt_m = net_debt,
-        net_cash_m = (-net_debt) if net_debt is not None else None,
+        pe_ttm_ib  = pe_ib,
+        net_debt_m = g0("NetDebt_I"),
         mktcap_m   = g("MKTCAP"),
-        pe_ttm     = g("PEEXCLXOR"),
     )
 
 
@@ -145,45 +176,48 @@ def process_ticker(ticker: str, ib: IB) -> StockResult:
         mkt = None
         try:
             _limiter.acquire()
-
-            # snapshot=False + sleep 才能拿到 fundamentalRatios
             mkt = ib.reqMktData(contract, genericTickList="47", snapshot=False)
             ib.sleep(MKT_DATA_WAIT)
 
             d = parse_fr(mkt.fundamentalRatios)
-
             if d is None:
                 res.status = "skipped"
                 res.reason = "fundamentalRatios=None"
                 return res
 
+            # 填充结果
             res.forward_pe = d["forward_pe"]
-            res.ntm_eps    = d["ntm_eps"]
+            res.pe_src     = d["pe_src"]
+            res.ttm_eps    = d["ttm_eps"]
             res.price      = d["price"]
-            res.net_debt_m = d["net_debt_m"]
-            res.net_cash_m = d["net_cash_m"]
+            res.pe_ttm_ib  = d["pe_ttm_ib"]
             res.mktcap_m   = d["mktcap_m"]
-            res.pe_ttm     = d["pe_ttm"]
 
-            # ── 筛选逻辑 ──────────────────────────────────────────────────
-            fpe       = res.forward_pe
-            net_cash  = res.net_cash_m   # 负 net_debt = 正 net_cash
+            net_debt       = d["net_debt_m"]
+            res.net_debt_m = net_debt
+            res.net_cash_m = (-net_debt) if net_debt is not None else None
 
+            fpe      = res.forward_pe
+            net_cash = res.net_cash_m
+
+            # ── 筛选 ──────────────────────────────────────────────────────
             if fpe is None:
                 res.status = "skipped"
-                res.reason = f"无AFEEPSNTM或NPRICE (ntm_eps={d['ntm_eps']}, price={d['price']})"
+                res.reason = f"无法计算PE(ttm_eps={d['ttm_eps']},price={d['price']})"
             elif net_cash is None:
                 res.status = "skipped"
                 res.reason = "无NetDebt_I"
             elif fpe < FORWARD_PE_MAX and net_cash > 0:
                 res.status = "passed"
+                res.reason = d["pe_src"]
             else:
                 res.status = "failed"
-                res.reason = (
-                    f"PE={fpe:.1f}>={FORWARD_PE_MAX}" if fpe >= FORWARD_PE_MAX else ""
-                ) + (
-                    f" 净现金={net_cash:.0f}M<=0" if net_cash <= 0 else ""
-                )
+                parts = []
+                if fpe >= FORWARD_PE_MAX:
+                    parts.append(f"PE={fpe:.1f}>={FORWARD_PE_MAX}")
+                if net_cash <= 0:
+                    parts.append(f"净现金={net_cash:.0f}M<=0")
+                res.reason = "  ".join(parts) + f"  [{d['pe_src']}]"
 
             return res
 
@@ -210,7 +244,6 @@ def process_ticker(ticker: str, ib: IB) -> StockResult:
 # ─── Worker 线程 ─────────────────────────────────────────────────────────────────
 def worker_main(worker_id: int, task_queue: queue.Queue,
                 result_list: list, result_lock: threading.Lock, progress: tqdm):
-    # 每个子线程必须创建独立的 asyncio 事件循环
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -238,15 +271,14 @@ def worker_main(worker_id: int, task_queue: queue.Queue,
             log.info(
                 f"{icon} {ticker:8s}  "
                 f"FwdPE={str(res.forward_pe or 'N/A'):>6}  "
-                f"净现金={res.net_cash_m if res.net_cash_m is not None else 'N/A'!s:>9}M  "
-                f"{'[' + res.reason + ']' if res.reason else ''}"
+                f"净现金={res.net_cash_m if res.net_cash_m is not None else 'N/A'!s:>10}M  "
+                f"src={res.pe_src:12s}  "
+                f"{res.reason[:50]}"
             )
-
             with result_lock:
                 result_list.append(res)
             progress.update(1)
             task_queue.task_done()
-
     finally:
         ib.disconnect()
         loop.close()
@@ -260,11 +292,13 @@ def load_tickers(filepath: str) -> list:
                 if l.strip() and not l.strip().startswith("#")]
 
 
+
+
 def main():
     tickers = load_tickers(TICKER_FILE)
-    log.info(f"读取到 {len(tickers)} 只股票，启动 {NUM_WORKERS} 个 Worker")
-    log.info(f"筛选条件: Forward PE < {FORWARD_PE_MAX}  且  净现金(NetDebt_I<0) > 0")
+    log.info(f"读取到 {len(tickers)} 只股票")
 
+    # 多线程筛选
     asyncio.set_event_loop(asyncio.new_event_loop())
 
     task_queue  = queue.Queue()
@@ -273,6 +307,7 @@ def main():
     for t in tickers:
         task_queue.put(t)
 
+    log.info(f"启动 {NUM_WORKERS} 个 Worker，筛选条件: Forward PE < {FORWARD_PE_MAX} 且 净现金 > 0")
     start  = time.time()
     actual = min(NUM_WORKERS, len(tickers))
 
@@ -286,7 +321,7 @@ def main():
             )
             threads.append(t)
             t.start()
-            time.sleep(0.4)   # 错开连接
+            time.sleep(0.4)
         for t in threads:
             t.join()
 
@@ -303,33 +338,32 @@ def main():
 
     if not passed:
         print("没有股票符合条件。")
-        # 打印前10个 skipped 的原因，辅助调试
-        print("\n前10个跳过原因：")
-        for r in skipped[:10]:
-            print(f"  {r.ticker:8s} → {r.reason}")
+        if skipped:
+            print("\n前10个跳过原因：")
+            for r in skipped[:10]:
+                print(f"  {r.ticker:8s} → {r.reason}")
         return
 
-    # 构建输出 DataFrame
     rows = [{
-        "Ticker"     : r.ticker,
-        "Forward_PE" : r.forward_pe,
-        "NTM_EPS"    : r.ntm_eps,
-        "Price"      : r.price,
-        "NetCash_M"  : r.net_cash_m,
-        "NetDebt_M"  : r.net_debt_m,
-        "MktCap_M"   : r.mktcap_m,
-        "TTM_PE"     : r.pe_ttm,
+        "Ticker"    : r.ticker,
+        "Forward_PE": r.forward_pe,
+        "PE_Src"    : r.pe_src,
+        "TTM_EPS"   : r.ttm_eps,
+        "Price"     : r.price,
+        "NetCash_M" : r.net_cash_m,
+        "NetDebt_M" : r.net_debt_m,
+        "MktCap_M"  : r.mktcap_m,
+        "PE_TTM_IB" : r.pe_ttm_ib,
     } for r in passed]
 
     df = pd.DataFrame(rows).sort_values("Forward_PE").reset_index(drop=True)
-
     pd.set_option("display.max_rows", 500)
-    pd.set_option("display.width", 120)
-    print(f"\n✅ 符合条件的股票（Forward PE < {FORWARD_PE_MAX} 且 净现金 > 0）：")
-    print(df.to_string(index=False))
+    pd.set_option("display.width", 140)
 
+    print(f"\n✅ 符合条件（Forward PE < {FORWARD_PE_MAX} 且 净现金 > 0）：")
+    print(df.to_string(index=False))
     df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
-    print(f"\n📄 结果已保存: {OUTPUT_CSV}")
+    print(f"\n📄 已保存: {OUTPUT_CSV}")
     print(f"   Forward PE 均值: {df['Forward_PE'].mean():.2f}")
     print(f"   净现金中位数:    {df['NetCash_M'].median():.0f} M")
 
