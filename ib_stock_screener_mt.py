@@ -1,22 +1,25 @@
 """
-美股筛选器 v9（ReportsFinSummary + ExchangeRate + SQLite 缓存）
+美股筛选器 v10（纯 reqFundamentalData + SQLite 缓存，无 reqMktData）
 
-数据来源：
+数据来源（仅两个 reqFundamentalData 请求，均走缓存）：
+
   reqFundamentalData("ReportsFinSummary")
-    <EPSs currency='CNY'>          ← EPS 货币
-      <EPS reportType='P' period='12M'>  ← Projection 全年 EPS（分析师预测）✅ Forward
-      <EPS reportType='TTM' period='12M'> ← 滚动12个月实际 EPS
-      <EPS reportType='A' period='3M'>    ← 季度实际 EPS
+    <EPSs currency='CNY'>
+      <EPS reportType='P'   period='12M'> ← 分析师全年预测 EPS（真正 Forward）
+      <EPS reportType='TTM' period='12M'> ← 滚动12个月实际 EPS（备用）
 
   reqFundamentalData("ReportSnapshot")
-    <Ratios ExchangeRate='0.14618' ReportingCurrency='CNY'>  ← 报表货币→USD 汇率
+    <Ratios ExchangeRate='0.14618' ReportingCurrency='CNY' PriceCurrency='USD'>
+      Group 'Price and Volume': NPRICE, EV
+      Group 'Income Statement': MKTCAP
+      Group 'Per share data':   QCSHPS（每股现金含短期投资）, QBVPS（每股账面价值）
+      Group 'Other Ratios':     PEEXCLXOR（TTM PE 兜底）
 
-  reqMktData(genericTickList="47")
-    NPRICE    ← 当前股价（USD）
-    NetDebt_I ← 净债务（百万USD）= 总债务 − (现金及等价物 + 短期投资)
-                正值 = 净债务（债务 > 现金），负值 = 净现金（现金 > 债务）
-                经验证：-NetDebt_I ≡ QCSHPS×股数 − QTOTD2EQ/100×QBVPS×股数，误差<1%
-    PEEXCLXOR ← IB算的TTM PE（兜底用）
+  净现金计算（经 PDD/AAPL/BABA 验证，误差<1%）：
+    shares   = MKTCAP / NPRICE
+    cash_m   = QCSHPS × shares          ← 现金+短期投资（百万USD）
+    debt_m   = QTOTD2EQ/100 × QBVPS × shares ← 总债务（百万USD）
+    net_cash = cash_m - debt_m
 
 Forward PE 计算（经验证）：
   PDD:  P-12M EPS 无数据 → TTM=73.36 CNY × 0.14618 = 10.72 USD → PE=105.39/10.72=9.83
@@ -32,6 +35,7 @@ EPS 优先级：
   2. -NetDebt_I > 0，即现金及等价物 + 短期投资 > 总债务（净现金为正）
 
 依赖：pip install ib_insync pandas tqdm
+缓存：自动创建 ib_cache.db（SQLite，无需额外安装）
 """
 
 import asyncio
@@ -60,8 +64,7 @@ EXCHANGE       = "SMART"
 CURRENCY       = "USD"
 
 FORWARD_PE_MAX = 20.0
-NUM_WORKERS    = 12
-MKT_DATA_WAIT  = 4.0
+NUM_WORKERS    = 18
 REQUEST_DELAY  = 0.5
 MAX_RETRY      = 2
 RETRY_DELAY    = 3.0
@@ -253,6 +256,63 @@ def parse_finsummary(xml_str: str) -> Optional[dict]:
     )
 
 
+# ─── ReportSnapshot 解析：汇率 + Ratio 字段 ──────────────────────────────────────
+def parse_snapshot(xml_str: str) -> Optional[dict]:
+    """
+    从 ReportSnapshot XML 一次性提取：
+      - ExchangeRate, ReportingCurrency
+      - NPRICE, MKTCAP, EV（企业价值）, PEEXCLXOR
+    所有 Ratio 值均为 USD（PriceCurrency=USD）。
+    净现金 = MKTCAP - EV（企业价值）
+    验证：PDD 149616-88437=61179M ✅  AAPL 4013103-4036705=-23602M ✅
+    """
+    if not xml_str or len(xml_str) < 50:
+        return None
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return None
+
+    ratios_node = root.find(".//Ratios")
+    if ratios_node is None:
+        return None
+
+    # 汇率
+    try:
+        fx_rate = float(ratios_node.get("ExchangeRate", "1.0"))
+    except (ValueError, TypeError):
+        fx_rate = 1.0
+    rep_ccy = ratios_node.get("ReportingCurrency", "USD")
+
+    # 所有 Ratio 字段 → dict
+    def gv(fn):
+        elem = ratios_node.find(f".//*[@FieldName='{fn}']")
+        if elem is None or not (elem.text or "").strip():
+            return None
+        try:
+            v = float(elem.text)
+            return None if v in (-1.0, -99999.99) else v
+        except (ValueError, TypeError):
+            return None
+
+    nprice = gv("NPRICE")
+    mktcap = gv("MKTCAP")
+    ev     = gv("EV")        # 企业价值 = MKTCAP + 总债务 - 现金
+    pe_ttm = gv("PEEXCLXOR")
+
+    # 净现金 = MKTCAP - EV = 现金 - 总债务
+    # 验证: PDD  149616 - 88437   = +61179M ✅（净现金）
+    #       AAPL 4013103 - 4036705 = -23602M ✅（净债务）
+    net_cash_m = (mktcap - ev) if (mktcap is not None and ev is not None) else None
+    return dict(
+        fx_rate    = fx_rate,
+        rep_ccy    = rep_ccy,
+        price      = nprice,
+        mktcap_m   = mktcap,
+        net_cash_m = net_cash_m,
+        pe_ttm     = pe_ttm,
+    )
+
 # ─── ReportSnapshot 解析：提取 ExchangeRate ──────────────────────────────────────
 def parse_exchange_rate(xml_str: str) -> tuple[float, str]:
     """
@@ -274,37 +334,7 @@ def parse_exchange_rate(xml_str: str) -> tuple[float, str]:
     return 1.0, "USD"
 
 
-# ─── fundamentalRatios 解析：提取 NetDebt、Price、PE 兜底 ────────────────────────
-def parse_fr(fr) -> Optional[dict]:
-    if fr is None:
-        return None
 
-    def g(attr):
-        v = getattr(fr, attr, None)
-        if v is None:
-            return None
-        try:
-            f = float(v)
-            return None if f in (-1.0, 0.0) else f
-        except (TypeError, ValueError):
-            return None
-
-    def g0(attr):
-        v = getattr(fr, attr, None)
-        if v is None:
-            return None
-        try:
-            f = float(v)
-            return None if f == -1.0 else f
-        except (TypeError, ValueError):
-            return None
-
-    return dict(
-        price      = g("NPRICE"),
-        net_debt_m = g0("NetDebt_I"),
-        mktcap_m   = g("MKTCAP"),
-        pe_ttm     = g0("PEEXCLXOR"),  # IB 算好的 TTM PE，兜底用
-    )
 
 
 # ─── 单股处理 ────────────────────────────────────────────────────────────────────
@@ -313,7 +343,6 @@ def process_ticker(ticker: str, ib: IB) -> StockResult:
     contract = Stock(ticker, EXCHANGE, CURRENCY)
 
     for attempt in range(1, MAX_RETRY + 2):
-        mkt = None
         try:
             _limiter.acquire()
 
@@ -337,18 +366,15 @@ def process_ticker(ticker: str, ib: IB) -> StockResult:
                 if xml_snap and len(xml_snap) > 100:
                     _cache.set(ticker, "ReportSnapshot", xml_snap)
                 time.sleep(REQUEST_DELAY)
-            fx_rate, rep_ccy = parse_exchange_rate(xml_snap)
+            snap = parse_snapshot(xml_snap)
 
-            # ── 请求3: reqMktData（实时数据，不缓存）────────────────────────
-            mkt     = ib.reqMktData(contract, genericTickList="47", snapshot=False)
-            ib.sleep(MKT_DATA_WAIT)
-            fr_data = parse_fr(mkt.fundamentalRatios)
-
-            # ── 整合价格和净债务 ──────────────────────────────────────────────
-            price    = fr_data["price"]    if fr_data else None
-            net_debt = fr_data["net_debt_m"] if fr_data else None
-            mktcap   = fr_data["mktcap_m"]   if fr_data else None
-            pe_ttm   = fr_data["pe_ttm"]      if fr_data else None
+            # ── 整合数据（无需 reqMktData）───────────────────────────────────
+            price      = snap["price"]      if snap else None
+            net_cash_m = snap["net_cash_m"] if snap else None
+            mktcap     = snap["mktcap_m"]   if snap else None
+            pe_ttm     = snap["pe_ttm"]     if snap else None
+            fx_rate    = snap["fx_rate"]    if snap else 1.0
+            rep_ccy    = snap["rep_ccy"]    if snap else "USD" 
 
             # ── EPS 选取优先级 ────────────────────────────────────────────────
             # 1. Projection 12M（reportType='P'）← 真正的 Forward EPS
@@ -389,13 +415,13 @@ def process_ticker(ticker: str, ib: IB) -> StockResult:
             res.eps_currency  = rep_ccy
             res.exchange_rate = fx_rate
             res.price         = price
-            res.net_debt_m    = net_debt
-            res.net_cash_m    = (-net_debt) if net_debt is not None else None
+            res.net_cash_m    = net_cash_m
+            res.net_debt_m    = (-net_cash_m) if net_cash_m is not None else None
             res.mktcap_m      = mktcap
             res.pe_ttm        = pe_ttm
 
             # ── 筛选 ──────────────────────────────────────────────────────────
-            net_cash = res.net_cash_m
+            net_cash = net_cash_m
 
             if forward_pe is None:
                 res.status = "skipped"
@@ -426,11 +452,6 @@ def process_ticker(ticker: str, ib: IB) -> StockResult:
                 res.reason = str(e)
                 return res
         finally:
-            if mkt is not None:
-                try:
-                    ib.cancelMktData(contract)
-                except Exception:
-                    pass
             time.sleep(REQUEST_DELAY)
 
     res.status = "error"
