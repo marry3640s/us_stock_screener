@@ -1,5 +1,5 @@
 """
-美股筛选器 v8（ReportsFinSummary + ExchangeRate 精确 Forward PE）
+美股筛选器 v9（ReportsFinSummary + ExchangeRate + SQLite 缓存）
 
 数据来源：
   reqFundamentalData("ReportsFinSummary")
@@ -13,7 +13,9 @@
 
   reqMktData(genericTickList="47")
     NPRICE    ← 当前股价（USD）
-    NetDebt_I ← 净债务（百万，负=净现金）
+    NetDebt_I ← 净债务（百万USD）= 总债务 − (现金及等价物 + 短期投资)
+                正值 = 净债务（债务 > 现金），负值 = 净现金（现金 > 债务）
+                经验证：-NetDebt_I ≡ QCSHPS×股数 − QTOTD2EQ/100×QBVPS×股数，误差<1%
     PEEXCLXOR ← IB算的TTM PE（兜底用）
 
 Forward PE 计算（经验证）：
@@ -27,7 +29,7 @@ EPS 优先级：
 
 筛选条件：
   1. Forward PE < FORWARD_PE_MAX
-  2. NetDebt_I < 0（净现金 > 总债务）
+  2. -NetDebt_I > 0，即现金及等价物 + 短期投资 > 总债务（净现金为正）
 
 依赖：pip install ib_insync pandas tqdm
 """
@@ -38,6 +40,9 @@ import queue
 import logging
 import threading
 import xml.etree.ElementTree as ET
+import sqlite3
+import json
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Optional
 
@@ -50,18 +55,20 @@ IB_HOST        = "127.0.0.1"
 IB_PORT        = 4001
 BASE_CLIENT_ID = 10
 
-TICKER_FILE    = "tickers.txt"
+TICKER_FILE    = "all_tickers.txt"
 EXCHANGE       = "SMART"
 CURRENCY       = "USD"
 
 FORWARD_PE_MAX = 20.0
-NUM_WORKERS    = 20
+NUM_WORKERS    = 12
 MKT_DATA_WAIT  = 4.0
 REQUEST_DELAY  = 0.5
 MAX_RETRY      = 2
 RETRY_DELAY    = 3.0
 
 OUTPUT_CSV     = "screened_stocks.csv"
+CACHE_DB       = "ib_cache.db"     # SQLite 缓存文件
+CACHE_TTL_DAYS = 45                # 缓存有效期（天），建议 30~60
 # ──────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -71,6 +78,87 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
+
+# ─── SQLite 缓存 ─────────────────────────────────────────────────────────────────
+class FundamentalCache:
+    """
+    线程安全的 SQLite 缓存。
+    存储三类原始 XML/数据，按 ticker + report_type 作为 key。
+    过期时间由 CACHE_TTL_DAYS 控制。
+    """
+
+    def __init__(self, db_path: str, ttl_days: int):
+        self._db    = db_path
+        self._ttl   = timedelta(days=ttl_days)
+        self._lock  = threading.Lock()
+        self._init_db()
+
+    def _conn(self):
+        # check_same_thread=False + 外部锁保证线程安全
+        return sqlite3.connect(self._db, check_same_thread=False)
+
+    def _init_db(self):
+        with self._lock, self._conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS cache (
+                    ticker      TEXT NOT NULL,
+                    report_type TEXT NOT NULL,
+                    data        TEXT NOT NULL,
+                    fetched_at  TEXT NOT NULL,
+                    PRIMARY KEY (ticker, report_type)
+                )
+            """)
+            conn.commit()
+
+    def get(self, ticker: str, report_type: str) -> Optional[str]:
+        """返回未过期的缓存数据，否则返回 None。"""
+        with self._lock, self._conn() as conn:
+            row = conn.execute(
+                "SELECT data, fetched_at FROM cache WHERE ticker=? AND report_type=?",
+                (ticker, report_type)
+            ).fetchone()
+        if row is None:
+            return None
+        data, fetched_at = row
+        age = datetime.utcnow() - datetime.fromisoformat(fetched_at)
+        if age > self._ttl:
+            log.debug(f"[cache] {ticker}/{report_type} 已过期({age.days}天)")
+            return None
+        return data
+
+    def set(self, ticker: str, report_type: str, data: str):
+        """写入或更新缓存。"""
+        now = datetime.utcnow().isoformat()
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """INSERT INTO cache(ticker, report_type, data, fetched_at)
+                   VALUES(?,?,?,?)
+                   ON CONFLICT(ticker, report_type) DO UPDATE
+                   SET data=excluded.data, fetched_at=excluded.fetched_at""",
+                (ticker, report_type, data, now)
+            )
+            conn.commit()
+
+    def invalidate(self, ticker: str):
+        """手动清除某只股票的所有缓存（调试用）。"""
+        with self._lock, self._conn() as conn:
+            conn.execute("DELETE FROM cache WHERE ticker=?", (ticker,))
+            conn.commit()
+        log.info(f"[cache] 已清除 {ticker} 的缓存")
+
+    def stats(self) -> dict:
+        """返回缓存统计信息。"""
+        with self._lock, self._conn() as conn:
+            total  = conn.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
+            fresh  = conn.execute(
+                "SELECT COUNT(*) FROM cache WHERE fetched_at > ?",
+                ((datetime.utcnow() - self._ttl).isoformat(),)
+            ).fetchone()[0]
+        return {"total": total, "fresh": fresh, "expired": total - fresh}
+
+
+_cache = FundamentalCache(CACHE_DB, CACHE_TTL_DAYS)
 
 # ─── 令牌桶 ─────────────────────────────────────────────────────────────────────
 class TokenBucket:
@@ -107,8 +195,8 @@ class StockResult:
     eps_currency : str             = ""     # 报表货币
     exchange_rate: Optional[float] = None   # 汇率
     price        : Optional[float] = None
-    net_debt_m   : Optional[float] = None
-    net_cash_m   : Optional[float] = None
+    net_debt_m   : Optional[float] = None   # NetDebt_I = 总债务−(现金+短期投资)，百万USD；正=净债务
+    net_cash_m   : Optional[float] = None   # -NetDebt_I = 现金+短期投资−总债务；正=净现金 ✅筛选用
     mktcap_m     : Optional[float] = None
     pe_ttm       : Optional[float] = None   # PEEXCLXOR 参考
     status       : str             = "pending"
@@ -229,17 +317,29 @@ def process_ticker(ticker: str, ib: IB) -> StockResult:
         try:
             _limiter.acquire()
 
-            # ── 请求1: ReportsFinSummary（EPS 序列 + 货币）───────────────────
-            xml_fs = ib.reqFundamentalData(contract, reportType="ReportsFinSummary")
-            fs     = parse_finsummary(xml_fs)
-            time.sleep(REQUEST_DELAY)
+            # ── 请求1: ReportsFinSummary（优先读缓存）────────────────────────
+            xml_fs = _cache.get(ticker, "ReportsFinSummary")
+            if xml_fs:
+                log.debug(f"[{ticker}] ReportsFinSummary 命中缓存")
+            else:
+                xml_fs = ib.reqFundamentalData(contract, reportType="ReportsFinSummary")
+                if xml_fs and len(xml_fs) > 100:
+                    _cache.set(ticker, "ReportsFinSummary", xml_fs)
+                time.sleep(REQUEST_DELAY)
+            fs = parse_finsummary(xml_fs)
 
-            # ── 请求2: ReportSnapshot（ExchangeRate）────────────────────────
-            xml_snap = ib.reqFundamentalData(contract, reportType="ReportSnapshot")
+            # ── 请求2: ReportSnapshot（优先读缓存）──────────────────────────
+            xml_snap = _cache.get(ticker, "ReportSnapshot")
+            if xml_snap:
+                log.debug(f"[{ticker}] ReportSnapshot 命中缓存")
+            else:
+                xml_snap = ib.reqFundamentalData(contract, reportType="ReportSnapshot")
+                if xml_snap and len(xml_snap) > 100:
+                    _cache.set(ticker, "ReportSnapshot", xml_snap)
+                time.sleep(REQUEST_DELAY)
             fx_rate, rep_ccy = parse_exchange_rate(xml_snap)
-            time.sleep(REQUEST_DELAY)
 
-            # ── 请求3: reqMktData（NetDebt_I、NPRICE、PE 兜底）──────────────
+            # ── 请求3: reqMktData（实时数据，不缓存）────────────────────────
             mkt     = ib.reqMktData(contract, genericTickList="47", snapshot=False)
             ib.sleep(MKT_DATA_WAIT)
             fr_data = parse_fr(mkt.fundamentalRatios)
@@ -338,6 +438,27 @@ def process_ticker(ticker: str, ib: IB) -> StockResult:
 
 
 # ─── Worker 线程 ─────────────────────────────────────────────────────────────────
+RECONNECT_WAIT    = 10   # 每次重连前等待（秒）
+RECONNECT_RETRIES = 12   # 最多重连次数（12×10s ≈ 2 分钟）
+
+
+def _connect_with_retry(ib: IB, client_id: int, tname: str) -> bool:
+    """尝试连接，失败则重试，返回是否成功。"""
+    for attempt in range(1, RECONNECT_RETRIES + 1):
+        try:
+            if ib.isConnected():
+                return True
+            ib.connect(IB_HOST, IB_PORT, clientId=client_id)
+            log.info(f"[{tname}] 已连接 (clientId={client_id})")
+            return True
+        except Exception as e:
+            log.warning(f"[{tname}] 连接失败({attempt}/{RECONNECT_RETRIES}): {e}，"
+                        f"{RECONNECT_WAIT}s 后重试...")
+            time.sleep(RECONNECT_WAIT)
+    log.error(f"[{tname}] 重连耗尽，放弃")
+    return False
+
+
 def worker_main(worker_id: int, task_queue: queue.Queue,
                 result_list: list, result_lock: threading.Lock, progress: tqdm):
     loop = asyncio.new_event_loop()
@@ -347,22 +468,47 @@ def worker_main(worker_id: int, task_queue: queue.Queue,
     tname     = threading.current_thread().name
 
     ib = IB()
-    try:
-        ib.connect(IB_HOST, IB_PORT, clientId=client_id)
-        log.info(f"[{tname}] 已连接 (clientId={client_id})")
-    except Exception as e:
-        log.error(f"[{tname}] 连接失败: {e}")
+    if not _connect_with_retry(ib, client_id, tname):
         loop.close()
         return
 
     try:
         while True:
+            # ── 取任务 ────────────────────────────────────────────────────────
             try:
                 ticker = task_queue.get_nowait()
             except queue.Empty:
                 break
 
-            res  = process_ticker(ticker, ib)
+            # ── 处理每只股票前检查连接 ────────────────────────────────────────
+            if not ib.isConnected():
+                log.warning(f"[{tname}] 检测到断线，尝试重连...")
+                try:
+                    ib.disconnect()
+                except Exception:
+                    pass
+                ib = IB()
+                if not _connect_with_retry(ib, client_id, tname):
+                    task_queue.put(ticker)
+                    task_queue.task_done()
+                    break
+
+            res = process_ticker(ticker, ib)
+
+            # ── 若因断线失败，重连后重新入队 ─────────────────────────────────
+            if res.status == "error" and not ib.isConnected():
+                log.warning(f"[{tname}] {ticker} 因断线失败，重连后重新入队")
+                try:
+                    ib.disconnect()
+                except Exception:
+                    pass
+                ib = IB()
+                if _connect_with_retry(ib, client_id, tname):
+                    task_queue.put(ticker)
+                task_queue.task_done()
+                progress.update(1)
+                continue
+
             icon = {"passed": "✅", "failed": "❌",
                     "skipped": "⚠️", "error": "🔴"}.get(res.status, "?")
             log.info(
@@ -378,9 +524,12 @@ def worker_main(worker_id: int, task_queue: queue.Queue,
             progress.update(1)
             task_queue.task_done()
     finally:
-        ib.disconnect()
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
         loop.close()
-        log.info(f"[{tname}] 已断开")
+        log.info(f"[{tname}] 已退出")
 
 
 # ─── 主函数 ──────────────────────────────────────────────────────────────────────
@@ -393,6 +542,8 @@ def load_tickers(filepath: str) -> list:
 def main():
     tickers = load_tickers(TICKER_FILE)
     log.info(f"读取到 {len(tickers)} 只股票，启动 {NUM_WORKERS} 个 Worker")
+    cs = _cache.stats()
+    log.info(f"缓存状态: 共 {cs['total']} 条，有效 {cs['fresh']} 条，过期 {cs['expired']} 条（TTL={CACHE_TTL_DAYS}天）")
     log.info(f"筛选: Forward PE < {FORWARD_PE_MAX}  且  净现金 > 0")
 
     asyncio.set_event_loop(asyncio.new_event_loop())
