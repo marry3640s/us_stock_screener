@@ -1,5 +1,5 @@
 """
-SEC 财报下载器
+SEC 财报下载器（多线程 + 双层断点续存版）
 
 核心思路：
   美股（10-K / 10-Q）：从 submissions.json 取最新的，直接下载。
@@ -11,23 +11,47 @@ SEC 财报下载器
     3. 大于 MIN_6K_BYTES（200KB）的视为财务 6-K
     4. 与最新 20-F 比日期，谁新下谁
 
+多线程改造说明：
+  - 使用 ThreadPoolExecutor 并发处理多个 ticker（默认 5 个）
+  - 全局 RateLimiter 控制对 SEC 的请求速率（默认 ≤10 req/s）
+  - _ticker_map / _idx_cache 用 threading.Lock 保护
+  - tqdm 进度条通过 lock 线程安全更新
+
+双层断点续存：
+  ① ticker 级：进度记录到 sec-data/progress.json；
+               重启后自动跳过 status=ok/exists/skip 的 ticker，
+               只重跑 error / 未处理的
+  ② 文件级：下载中断后留 .part 临时文件；
+            重启后用 HTTP Range: bytes=<offset>- 从断点续传；
+            下载完成后原子重命名为目标文件
+
 文件保存到 ./sec-data/<TICKER>/ 目录
 依赖：pip install requests tqdm
 """
 
 import re
+import json
 import time
 import logging
+import threading
 from typing import Optional
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
 from pathlib import Path
 from tqdm import tqdm
 
 # ─── 配置 ──────────────────────────────────────────────────────────────────────
-TICKER_FILE   = "tickers.txt"
+TICKER_FILE   = "all_tickers.txt"
 OUTPUT_DIR    = "sec-data"
-REQUEST_DELAY = 0.5
+
+# 并发 ticker 数量（建议 3~8，过高会被 SEC 限流）
+MAX_WORKERS   = 5
+
+# SEC 全局请求速率上限（每秒最多 N 次，官方建议 ≤10）
+MAX_RPS       = 8
+
 MAX_RETRY     = 3
 RETRY_DELAY   = 5.0
 
@@ -53,8 +77,87 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-HEADERS = {"User-Agent": USER_AGENT}
+HEADERS  = {"User-Agent": USER_AGENT}
 US_FORMS = ["10-K", "10-Q"]
+
+# ticker 级进度文件路径
+PROGRESS_FILE = Path(OUTPUT_DIR) / "progress.json"
+
+
+# ─── ticker 级断点续存 ────────────────────────────────────────────────────────
+_progress: dict      = {}
+_progress_lock       = threading.Lock()
+
+def load_progress() -> dict:
+    """从 progress.json 加载上次的进度记录。"""
+    global _progress
+    if PROGRESS_FILE.exists():
+        try:
+            with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+                _progress = json.load(f)
+            log.info(f"已加载进度文件，共 {len(_progress)} 条记录")
+        except Exception as e:
+            log.warning(f"读取进度文件失败，从头开始: {e}")
+            _progress = {}
+    return _progress
+
+
+def save_progress(ticker: str, result: dict):
+    """线程安全地将单条 ticker 结果写入进度文件。"""
+    with _progress_lock:
+        _progress[ticker] = {
+            "status": result["status"],
+            "form"  : result.get("form"),
+            "file"  : result.get("file"),
+            "date"  : result.get("date"),
+            "reason": result.get("reason", ""),
+        }
+        try:
+            PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = PROGRESS_FILE.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(_progress, f, ensure_ascii=False, indent=2)
+            tmp.replace(PROGRESS_FILE)   # 原子写入
+        except Exception as e:
+            log.warning(f"保存进度文件失败: {e}")
+
+
+def should_skip_ticker(ticker: str) -> Optional[dict]:
+    """
+    若该 ticker 上次已成功（ok/exists/skip），直接返回缓存结果；
+    否则返回 None，表示需要重新处理。
+    """
+    with _progress_lock:
+        rec = _progress.get(ticker)
+    if rec and rec.get("status") in ("ok", "exists", "skip"):
+        return rec
+    return None
+
+
+# ─── 全局速率限制器 ────────────────────────────────────────────────────────────
+class RateLimiter:
+    """令牌桶：限制全局每秒请求数，多线程安全。"""
+    def __init__(self, rps: float):
+        self._interval = 1.0 / rps
+        self._lock     = threading.Lock()
+        self._last     = 0.0
+
+    def __call__(self):
+        with self._lock:
+            now  = time.monotonic()
+            wait = self._interval - (now - self._last)
+            if wait > 0:
+                time.sleep(wait)
+            self._last = time.monotonic()
+
+
+_rate_limit = RateLimiter(MAX_RPS)
+
+
+def _get(url: str, **kwargs) -> requests.Response:
+    """带速率限制的 GET 请求。"""
+    _rate_limit()
+    return requests.get(url, headers=HEADERS, **kwargs)
 
 
 # ─── 季度工具 ─────────────────────────────────────────────────────────────────
@@ -74,46 +177,44 @@ def recent_quarters(n: int) -> list:
 
 
 # ─── master.idx 下载与解析 ────────────────────────────────────────────────────
-_idx_cache: dict = {}
+_idx_cache: dict  = {}
+_idx_lock         = threading.Lock()
 
 def fetch_master_idx(year: int, qtr: int) -> Optional[str]:
-    """下载并缓存 master.idx。"""
+    """下载并缓存 master.idx（线程安全）。"""
     cache_key = (year, qtr)
-    if cache_key in _idx_cache:
-        return _idx_cache[cache_key]
+
+    with _idx_lock:
+        if cache_key in _idx_cache:
+            return _idx_cache[cache_key]
 
     url = (f"https://www.sec.gov/Archives/edgar/full-index/"
            f"{year}/QTR{qtr}/master.idx")
+    result = None
     for attempt in range(1, MAX_RETRY + 1):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=30)
+            resp = _get(url, timeout=30)
             resp.raise_for_status()
-            _idx_cache[cache_key] = resp.text
+            result = resp.text
             log.debug(f"已加载 {year}/QTR{qtr}/master.idx ({len(resp.text)//1024}KB)")
-            return resp.text
+            break
         except Exception as e:
             if attempt < MAX_RETRY:
                 time.sleep(RETRY_DELAY)
             else:
                 log.warning(f"下载 master.idx 失败 {year}/QTR{qtr}: {e}")
-                _idx_cache[cache_key] = None
-                return None
-        finally:
-            time.sleep(REQUEST_DELAY)
-    return None
+
+    with _idx_lock:
+        _idx_cache[cache_key] = result
+    return result
 
 
 def parse_6k_from_master(cik: str) -> list:
     """
     扫描最近 IDX_QUARTERS 个季度的 master.idx，
-    返回该 CIK 的所有 6-K，每条包含：
-      - filingDate
-      - txt_url：完整的 https://www.sec.gov/Archives/... .txt URL
-      - accessionNumber
-    按日期从新到旧排序。
+    返回该 CIK 的所有 6-K，按日期从新到旧排序。
     """
-    cik_int = int(cik)
-    cik_str = str(cik_int)
+    cik_str = str(int(cik))
     results = []
 
     for year, qtr in recent_quarters(IDX_QUARTERS):
@@ -131,12 +232,11 @@ def parse_6k_from_master(cik: str) -> list:
             if parts[2].strip().upper() != "6-K":
                 continue
             date     = parts[3].strip()
-            filepath = parts[4].strip()   # edgar/data/{CIK}/{accnodash}.txt
+            filepath = parts[4].strip()
             txt_url  = f"https://www.sec.gov/Archives/{filepath}"
 
-            # 从路径提取 accession
             segs = filepath.replace("\\", "/").split("/")
-            acc_nodash = Path(segs[-1]).stem   # 去掉 .txt 后缀
+            acc_nodash = Path(segs[-1]).stem
             if len(acc_nodash) == 18 and acc_nodash.isdigit():
                 acc = f"{acc_nodash[:10]}-{acc_nodash[10:12]}-{acc_nodash[12:]}"
             else:
@@ -153,23 +253,19 @@ def parse_6k_from_master(cik: str) -> list:
     return results
 
 
-# ─── HEAD 检查文件大小 ────────────────────────────────────────────────────────
+# ─── 检查文件大小 ─────────────────────────────────────────────────────────────
 def get_file_size(url: str) -> Optional[int]:
     """
-    获取 URL 对应文件的实际大小（字节）。
-    SEC 的 .txt 文件 HEAD 不返回 Content-Length，
-    改用 streaming GET，只读取数据不写盘，统计实际字节数。
-    为避免大文件浪费流量，读到超过阈值就提前返回。
+    Streaming GET，读到超过 MIN_6K_BYTES 即提前返回，节省流量。
     """
     for attempt in range(1, MAX_RETRY + 1):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=30, stream=True)
+            resp = _get(url, timeout=30, stream=True)
             resp.raise_for_status()
             total = 0
             for chunk in resp.iter_content(chunk_size=65536):
                 total += len(chunk)
                 if total >= MIN_6K_BYTES:
-                    # 已经超过阈值，提前返回，不继续下载
                     resp.close()
                     return total
             return total
@@ -179,44 +275,43 @@ def get_file_size(url: str) -> Optional[int]:
             else:
                 log.debug(f"GET size 失败 {url}: {e}")
                 return None
-        finally:
-            time.sleep(REQUEST_DELAY)
     return None
 
 
 # ─── CIK / submissions ────────────────────────────────────────────────────────
 _ticker_map: Optional[dict] = None
+_ticker_map_lock             = threading.Lock()
 
 def get_cik_fast(ticker: str) -> Optional[str]:
     global _ticker_map
-    if _ticker_map is None:
-        url = "https://www.sec.gov/files/company_tickers.json"
-        for attempt in range(1, MAX_RETRY + 1):
-            try:
-                resp = requests.get(url, headers=HEADERS, timeout=30)
-                resp.raise_for_status()
-                raw = resp.json()
-                _ticker_map = {
-                    v["ticker"].upper(): str(v["cik_str"]).zfill(10)
-                    for v in raw.values()
-                }
-                log.info(f"已加载 SEC ticker 映射表，共 {len(_ticker_map)} 条")
-                break
-            except Exception as e:
-                if attempt < MAX_RETRY:
-                    time.sleep(RETRY_DELAY)
-                else:
-                    log.error(f"无法下载 company_tickers.json: {e}")
-                    _ticker_map = {}
-        time.sleep(REQUEST_DELAY)
-    return _ticker_map.get(ticker)
+    with _ticker_map_lock:
+        if _ticker_map is None:
+            url = "https://www.sec.gov/files/company_tickers.json"
+            for attempt in range(1, MAX_RETRY + 1):
+                try:
+                    resp = _get(url, timeout=30)
+                    resp.raise_for_status()
+                    raw = resp.json()
+                    _ticker_map = {
+                        v["ticker"].upper(): str(v["cik_str"]).zfill(10)
+                        for v in raw.values()
+                    }
+                    log.info(f"已加载 SEC ticker 映射表，共 {len(_ticker_map)} 条")
+                    break
+                except Exception as e:
+                    if attempt < MAX_RETRY:
+                        time.sleep(RETRY_DELAY)
+                    else:
+                        log.error(f"无法下载 company_tickers.json: {e}")
+                        _ticker_map = {}
+        return _ticker_map.get(ticker)
 
 
 def get_submissions(cik: str) -> Optional[dict]:
     url = f"https://data.sec.gov/submissions/CIK{cik}.json"
     for attempt in range(1, MAX_RETRY + 1):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=15)
+            resp = _get(url, timeout=15)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
@@ -225,8 +320,7 @@ def get_submissions(cik: str) -> Optional[dict]:
             else:
                 log.warning(f"[CIK {cik}] 获取 submissions 失败: {e}")
                 return None
-        finally:
-            time.sleep(REQUEST_DELAY)
+    return None
 
 
 def is_foreign(submissions: dict) -> bool:
@@ -239,7 +333,6 @@ def is_foreign(submissions: dict) -> bool:
 
 def find_latest_filing_from_submissions(submissions: dict,
                                         form_types: list) -> Optional[dict]:
-    """从 submissions JSON 找最新的指定类型 filing。"""
     recent     = submissions.get("filings", {}).get("recent", {})
     forms      = recent.get("form", [])
     accessions = recent.get("accessionNumber", [])
@@ -266,12 +359,6 @@ def find_latest_filing_from_submissions(submissions: dict,
 
 # ─── 核心：从 master.idx 找财务 6-K ──────────────────────────────────────────
 def find_financial_6k(cik: str) -> Optional[dict]:
-    """
-    从 master.idx 找该公司最新的财务 6-K：
-      - 取最近 IDX_QUARTERS 个季度所有 6-K
-      - 按日期从新到旧，HEAD 检查 .txt 文件大小
-      - 第一个 >= MIN_6K_BYTES 的即为财务 6-K
-    """
     candidates = parse_6k_from_master(cik)[:MAX_6K_SCAN]
     log.debug(f"[CIK {cik}] master.idx 共找到 {len(candidates)} 条 6-K")
 
@@ -281,7 +368,6 @@ def find_financial_6k(cik: str) -> Optional[dict]:
         log.debug(f"  {f['filingDate']}  {size_kb:>8s}  {f['txt_url']}")
         if size and size >= MIN_6K_BYTES:
             log.info(f"[CIK {cik}] 财务 6-K: {f['filingDate']} ({size//1024}KB)")
-            # 补充 primaryDocument 字段供下载使用（用 .txt 本身）
             f["primaryDocument"] = Path(f["filepath"]).name
             f["form"] = "6-K"
             return f
@@ -298,23 +384,52 @@ def build_filing_url(cik: str, accession: str, filename: str) -> str:
 
 
 def download_file(url: str, save_path: Path) -> bool:
+    """
+    文件级断点续传下载：
+      - 先检查 <save_path>.part 临时文件已有字节数
+      - 若服务器支持 Range，发送 Range: bytes=<offset>- 续传
+      - 下载完成后原子重命名 .part → save_path
+      - 若服务器不支持 Range（206 以外），从头下载
+    """
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    part_path = save_path.with_suffix(save_path.suffix + ".part")
+
     for attempt in range(1, MAX_RETRY + 1):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=60, stream=True)
+            offset = part_path.stat().st_size if part_path.exists() else 0
+
+            req_headers = dict(HEADERS)
+            if offset:
+                req_headers["Range"] = f"bytes={offset}-"
+                log.debug(f"续传 {save_path.name} 从 {offset//1024}KB")
+
+            _rate_limit()
+            resp = requests.get(url, headers=req_headers, timeout=60, stream=True)
+
+            # 服务器不支持 Range（返回 200 而非 206），从头下载
+            if offset and resp.status_code == 200:
+                log.debug(f"服务器不支持 Range，从头下载: {url}")
+                offset = 0
+                part_path.unlink(missing_ok=True)
+
             resp.raise_for_status()
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(save_path, "wb") as f:
+
+            mode = "ab" if offset else "wb"
+            with open(part_path, mode) as f:
                 for chunk in resp.iter_content(chunk_size=65536):
                     f.write(chunk)
+
+            # 原子重命名
+            part_path.replace(save_path)
             return True
+
         except Exception as e:
             if attempt < MAX_RETRY:
+                log.debug(f"下载出错（第{attempt}次），{RETRY_DELAY}s 后重试: {e}")
                 time.sleep(RETRY_DELAY)
             else:
                 log.warning(f"下载失败 {url}: {e}")
                 return False
-        finally:
-            time.sleep(REQUEST_DELAY)
     return False
 
 
@@ -322,7 +437,6 @@ def _download_filing(ticker: str, cik: str, filing: dict,
                      result: dict, form_label: str = None) -> dict:
     form = form_label or filing["form"]
 
-    # 6-K 用 txt_url 直接下载；其他用标准路径构造
     if "txt_url" in filing:
         url = filing["txt_url"]
         ext = ".txt"
@@ -338,6 +452,11 @@ def _download_filing(ticker: str, cik: str, filing: dict,
                       file=str(save_path), date=filing["filingDate"])
         return result
 
+    # 有 .part 文件说明上次下载中断，续传
+    part_path = save_path.with_suffix(save_path.suffix + ".part")
+    if part_path.exists():
+        log.info(f"[{ticker}] 发现未完成文件 {part_path.name}，尝试续传…")
+
     ok = download_file(url, save_path)
     if ok:
         result.update(status="ok", form=form,
@@ -348,62 +467,87 @@ def _download_filing(ticker: str, cik: str, filing: dict,
     return result
 
 
-# ─── 主处理逻辑 ───────────────────────────────────────────────────────────────
+# ─── 主处理逻辑（单 ticker） ──────────────────────────────────────────────────
 def process_ticker(ticker: str) -> dict:
     result = {"ticker": ticker, "status": "pending", "form": None,
               "file": None, "date": None, "reason": ""}
+
+    # ── ticker 级断点续存：上次已成功则直接返回缓存 ──────────────────────────
+    cached = should_skip_ticker(ticker)
+    if cached:
+        log.debug(f"[{ticker}] 跳过（上次已完成: {cached['status']}）")
+        return {**result, **cached, "ticker": ticker}
 
     cik = get_cik_fast(ticker)
     if not cik:
         result["status"] = "skip"
         result["reason"] = "未找到 CIK"
+        save_progress(ticker, result)
         return result
 
     subs = get_submissions(cik)
     if not subs:
         result["status"] = "error"
         result["reason"] = "无法获取 submissions"
+        save_progress(ticker, result)
         return result
 
     if not is_foreign(subs):
-        # ── 美股：10-K / 10-Q 取最新 ─────────────────────────────────────
         filing = find_latest_filing_from_submissions(subs, US_FORMS)
         if not filing:
             result["status"] = "skip"
             result["reason"] = "未找到 10-K/10-Q"
+            save_progress(ticker, result)
             return result
-        return _download_filing(ticker, cik, filing, result)
-
+        result = _download_filing(ticker, cik, filing, result)
+        save_progress(ticker, result)
+        return result
     else:
-        # ── 外国公司：财务 6-K vs 20-F，取更新的 ────────────────────────
         filing_6k  = find_financial_6k(cik)
         filing_20f = find_latest_filing_from_submissions(subs, ["20-F"])
 
         if not filing_6k and not filing_20f:
             result["status"] = "skip"
             result["reason"] = "未找到 20-F 或财务 6-K"
+            save_progress(ticker, result)
             return result
 
         if filing_6k and filing_20f:
             if filing_6k["filingDate"] >= filing_20f["filingDate"]:
                 log.info(f"[{ticker}] 6-K({filing_6k['filingDate']}) >= "
                          f"20-F({filing_20f['filingDate']}), 下载 6-K")
-                return _download_filing(ticker, cik, filing_6k, result, "6-K")
+                result = _download_filing(ticker, cik, filing_6k, result, "6-K")
             else:
                 log.info(f"[{ticker}] 20-F({filing_20f['filingDate']}) > "
                          f"6-K({filing_6k['filingDate']}), 下载 20-F")
-                return _download_filing(ticker, cik, filing_20f, result)
+                result = _download_filing(ticker, cik, filing_20f, result)
+            save_progress(ticker, result)
+            return result
 
         if filing_6k:
-            return _download_filing(ticker, cik, filing_6k, result, "6-K")
-        return _download_filing(ticker, cik, filing_20f, result)
+            result = _download_filing(ticker, cik, filing_6k, result, "6-K")
+        else:
+            result = _download_filing(ticker, cik, filing_20f, result)
+        save_progress(ticker, result)
+        return result
 
 
+# ─── 多线程主流程 ─────────────────────────────────────────────────────────────
 def main():
-    # 预加载 master.idx
+    Path(OUTPUT_DIR).mkdir(exist_ok=True)
+
+    # 加载上次进度（ticker 级断点续存）
+    load_progress()
+
+    # 预加载 master.idx（串行，避免重复下载）
     log.info(f"预加载最近 {IDX_QUARTERS} 个季度的 master.idx ...")
     for year, qtr in recent_quarters(IDX_QUARTERS):
         fetch_master_idx(year, qtr)
+    log.info("预加载完成")
+
+    # 预加载 CIK 映射（所有线程共用，提前加载避免并发重复请求）
+    log.info("预加载 SEC ticker → CIK 映射表 ...")
+    get_cik_fast("AAPL")   # 任意一次调用即可触发加载
     log.info("预加载完成")
 
     if DEBUG_TICKERS:
@@ -411,30 +555,47 @@ def main():
         log.info(f"[调试模式] 只处理: {tickers}")
     else:
         tickers = load_tickers(TICKER_FILE)
-        log.info(f"读取到 {len(tickers)} 只股票，开始下载财报...")
+        log.info(f"读取到 {len(tickers)} 只股票")
 
-    log.info(f"保存目录: {Path(OUTPUT_DIR).resolve()}")
     Path(OUTPUT_DIR).mkdir(exist_ok=True)
+    log.info(f"保存目录: {Path(OUTPUT_DIR).resolve()}")
+    log.info(f"并发 ticker 数: {MAX_WORKERS}，全局速率上限: {MAX_RPS} req/s")
 
-    stats = {"ok": 0, "exists": 0, "skip": 0, "error": 0}
+    already_done = sum(
+        1 for t in tickers
+        if _progress.get(t, {}).get("status") in ("ok", "exists", "skip")
+    )
+    if already_done:
+        log.info(f"断点续存：{already_done}/{len(tickers)} 只已完成，跳过")
+
+    stats     = {"ok": 0, "exists": 0, "skip": 0, "error": 0}
+    stats_lock = threading.Lock()
+
+    icon_map = {"ok": "✅", "exists": "📁", "skip": "⚠️", "error": "🔴"}
 
     with tqdm(total=len(tickers), desc="下载进度", unit="只") as pbar:
-        for ticker in tickers:
-            res = process_ticker(ticker)
-            stats[res["status"]] = stats.get(res["status"], 0) + 1
-
-            icon = {"ok": "✅", "exists": "📁", "skip": "⚠️",
-                    "error": "🔴"}.get(res["status"], "?")
-            msg  = res["file"] or res["reason"]
-            log.info(f"{icon} {ticker:8s}  {res.get('form',''):10s}  "
-                     f"{res.get('date',''):12s}  {msg}")
-            pbar.update(1)
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            future_to_ticker = {
+                pool.submit(process_ticker, t): t for t in tickers
+            }
+            for future in as_completed(future_to_ticker):
+                res  = future.result()
+                icon = icon_map.get(res["status"], "?")
+                msg  = res["file"] or res["reason"]
+                log.info(
+                    f"{icon} {res['ticker']:8s}  "
+                    f"{res.get('form',''):10s}  "
+                    f"{res.get('date',''):12s}  {msg}"
+                )
+                with stats_lock:
+                    stats[res["status"]] = stats.get(res["status"], 0) + 1
+                pbar.update(1)
 
     print(f"\n{'='*60}")
-    print(f"  ✅ 下载成功: {stats.get('ok',  0)}")
+    print(f"  ✅ 下载成功: {stats.get('ok',    0)}")
     print(f"  📁 已存在:   {stats.get('exists', 0)}")
-    print(f"  ⚠️  跳过:     {stats.get('skip', 0)}")
-    print(f"  🔴 失败:     {stats.get('error', 0)}")
+    print(f"  ⚠️  跳过:     {stats.get('skip',  0)}")
+    print(f"  🔴 失败:     {stats.get('error',  0)}")
     print(f"{'='*60}")
     print(f"  文件保存在: {Path(OUTPUT_DIR).resolve()}")
 
