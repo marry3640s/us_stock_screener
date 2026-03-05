@@ -712,6 +712,32 @@ def analyze_filing(filepath, ticker=""):
     ts = extract_shares_from_text(text)
     if not d.shares.common: d.shares.common = ts.common
     if not d.shares.weighted_avg: d.shares.weighted_avg = ts.weighted_avg
+    # 从 BS equity 注释提取真实流通股（如 "601 shares issued; 413 and 441 shares outstanding"）
+    if classified["BS"]:
+        for bs_tbl in classified["BS"]:
+            for row in bs_tbl["rows"]:
+                full_text = " ".join(c for c in row if c)
+                # "NNN and NNN shares outstanding" or "NNN shares outstanding"
+                m_out = re.search(r"([\d,]+)\s*and\s*([\d,]+)\s*shares\s+outstanding", full_text, re.I)
+                if m_out:
+                    bs_col = detect_latest_column(bs_tbl["rows"])
+                    v1 = parse_num(m_out.group(1))
+                    v2 = parse_num(m_out.group(2))
+                    # col=0 -> first value is latest; col=1 -> second is latest
+                    val = v1 if bs_col == 0 else v2
+                    if val and val > 1:
+                        um_bs = bs_tbl["unit_mult"] if bs_tbl["unit_mult"] > 0 else d.unit_multiplier
+                        d.shares.common = round(val * um_bs, 2) if um_bs > 0 else round(val, 2)
+                    break
+                m_single = re.search(r"([\d,]+)\s+shares\s+outstanding", full_text, re.I)
+                if m_single and not re.search(r"authorized|preferred", full_text, re.I):
+                    val = parse_num(m_single.group(1))
+                    if val and val > 1:
+                        um_bs = bs_tbl["unit_mult"] if bs_tbl["unit_mult"] > 0 else d.unit_multiplier
+                        d.shares.common = round(val * um_bs, 2) if um_bs > 0 else round(val, 2)
+                    break
+            if d.shares.common: break
+
     # 如果 common 仍然为空，用 weighted_avg 基本股数作为近似值
     if not d.shares.common and d.shares.weighted_avg:
         d.shares.common = d.shares.weighted_avg
