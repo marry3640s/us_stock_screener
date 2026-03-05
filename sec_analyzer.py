@@ -381,10 +381,11 @@ def extract_eps_contextual(rows, col=0):
                 eps_d = nums[col]
     return eps_b, eps_d
 
-def extract_shares_contextual(rows, col=0):
+def extract_shares_contextual(rows, col=0, table_text=""):
     """Context-aware shares extraction for '-Basic'/'-Diluted' sub-rows under Weighted-average header."""
     sh_b = sh_d = None
     in_shares = False
+    in_thousands = "thousand" in table_text.lower()
     for row in rows:
         first_cell = ''
         for c in row:
@@ -392,21 +393,21 @@ def extract_shares_contextual(rows, col=0):
             if c and c not in ('', '$', 'RMB', 'US$'):
                 first_cell = c; break
         fl = first_cell.lower()
-        if 'weighted' in fl and ('share' in fl or 'ordinary' in fl):
+        if 'weighted' in fl and ('share' in fl or 'ordinary' in fl or 'ads' in fl):
             in_shares = True
             continue
         if in_shares and not re.match(r'^-?\s*(?:basic|diluted)', fl):
             in_shares = False
             continue
-        if in_shares and re.match(r'^-?\s*basic', fl):
+        if in_shares and re.match(r'^-\s*basic', fl):
             nums = extract_numbers_from_row(row)
             if nums and len(nums) > col and nums[col] > 1000 and sh_b is None:
                 sh_b = nums[col]
-        if in_shares and re.match(r'^-?\s*diluted', fl):
+        if in_shares and re.match(r'^-\s*diluted', fl):
             nums = extract_numbers_from_row(row)
             if nums and len(nums) > col and nums[col] > 1000 and sh_d is None:
                 sh_d = nums[col]
-    return sh_b, sh_d
+    return sh_b, sh_d, in_thousands
 
 # ═══════════ 标签模式 ═══════════
 IS_PATTERNS = {
@@ -610,23 +611,33 @@ def analyze_filing(filepath, ticker=""):
             if d.eps_basic and d.eps_diluted: break
 
     # 股本：先上下文感知提取（-Basic/-Diluted），再标准模式后备
-    def shares_to_m(v):
+    def shares_to_m(v, in_thousands=None):
         if v is None or v <= 0: return None
-        return round(v / 1000, 2) if v > 10000 else round(v, 2)
+        if in_thousands is True:
+            return round(v / 1000, 2)
+        elif in_thousands is False:
+            if v > 1e6: return round(v / 1e6, 2)
+            if v > 1e3: return round(v / 1e3, 2)
+            return round(v, 2)
+        else:
+            if v > 1e8: return round(v / 1e6, 2)
+            if v > 10000: return round(v / 1000, 2)
+            return round(v, 2)
 
     for is_tbl in classified["IS"]:
         sc_col = detect_latest_column(is_tbl["rows"])
-        sb, sd = extract_shares_contextual(is_tbl["rows"], sc_col)
-        if sb and sb > 100: d.shares.weighted_avg = shares_to_m(sb)
-        if sd and sd > 100: d.shares.diluted = shares_to_m(sd)
+        tbl_txt = " ".join(" ".join(r) for r in is_tbl["rows"][:20])
+        sb, sd, sh_ik = extract_shares_contextual(is_tbl["rows"], sc_col, tbl_txt)
+        if sb and sb > 100: d.shares.weighted_avg = shares_to_m(sb, sh_ik)
+        if sd and sd > 100: d.shares.diluted = shares_to_m(sd, sh_ik)
         if d.shares.weighted_avg or d.shares.diluted: break
     if not d.shares.weighted_avg and not d.shares.diluted:
         for is_tbl in classified["IS"]:
             sh_std_col = detect_latest_column(is_tbl["rows"])
             shd = extract_from_table(is_tbl["rows"], SHARES_PATTERNS, col=sh_std_col)
             sb, sd = shd.get("shares_basic"), shd.get("shares_diluted")
-            if sb and sb > 100: d.shares.weighted_avg = shares_to_m(sb)
-            if sd and sd > 100: d.shares.diluted = shares_to_m(sd)
+            if sb and sb > 100: d.shares.weighted_avg = shares_to_m(sb, sh_ik)
+            if sd and sd > 100: d.shares.diluted = shares_to_m(sd, sh_ik)
             if d.shares.weighted_avg or d.shares.diluted: break
 
     # BS: merge ALL BS tables (some filings split Assets / Liabilities into separate tables)
