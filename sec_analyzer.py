@@ -393,7 +393,7 @@ def extract_eps_contextual(rows, col=0):
                 break
         fl = first_cell.lower().strip()
         # Detect section headers
-        if re.search(r'earnings\s+per\s+(?:ordinary|common|ads)', fl):
+        if re.search(r'(?:earnings|income|loss).*per\s+(?:share|ads|ordinary|common)', fl):
             in_eps_section = True
             in_shares_section = False
             continue
@@ -424,17 +424,17 @@ def extract_shares_contextual(rows, col=0, table_text=""):
             if c and c not in ('', '$', 'RMB', 'US$'):
                 first_cell = c; break
         fl = first_cell.lower()
-        if 'weighted' in fl and ('share' in fl or 'ordinary' in fl or 'ads' in fl):
+        if ('weighted' in fl or 'shares used' in fl) and ('share' in fl or 'ordinary' in fl or 'ads' in fl or 'computing' in fl):
             in_shares = True
             continue
         if in_shares and not re.match(r'^-?\s*(?:basic|diluted)', fl):
             in_shares = False
             continue
-        if in_shares and re.match(r'^-\s*basic', fl):
+        if in_shares and re.match(r'^-?\s*basic', fl):
             nums = extract_numbers_from_row(row)
             if nums and len(nums) > col and nums[col] > 1000 and sh_b is None:
                 sh_b = nums[col]
-        if in_shares and re.match(r'^-\s*diluted', fl):
+        if in_shares and re.match(r'^-?\s*diluted', fl):
             nums = extract_numbers_from_row(row)
             if nums and len(nums) > col and nums[col] > 1000 and sh_d is None:
                 sh_d = nums[col]
@@ -488,7 +488,7 @@ IS_PATTERNS = {
     "income_tax": [r"^(?:\(?benefit\s+from\)?\s+)?(?:provision\s+for\s+)?income\s+tax",
                     r"^(?:provision\s+for|income\s+tax)", r"^income\s+tax\s+expense",
                     r"^income\s+tax\s+and\s+social\s+contribution"],
-    "pretax_income": [r"^(?:income|loss|profit)\s+before\s+(?:income\s+)?tax",
+    "pretax_income": [r"^(?:income|loss|profit)\s*(?:\(loss\)\s*)?\s*before\s+(?:income\s+)?tax",
                        r"^(?:income|profit)\s+before\s+(?:provision|income\s+tax)",
                        r"^profit\s+before\s+income\s+tax"],
 }
@@ -537,17 +537,20 @@ CF_PATTERNS = {
     "operating_cf": [r"^(?:net\s+)?cash\s+(?:provided|generated|used)\s+(?:by|in|from)\s+operating",
                      r"^net\s+cash\s+(?:from|used\s+in|used\s+for)\s+operating",
                      r"^(?:net\s+)?cash\s+(?:flows?\s+)?(?:from|provided\s+by|generated\s+from)\s+operating",
-                     r"^net\s+cash\s+provided\s+by\s+\(?used\s+in\)?\s+operating"],
+                     r"^net\s+cash\s+provided\s+by\s+\(?used\s+in\)?\s+operating",
+                     r"^net\s+cash.*operating\s+activities"],
     "investing_cf": [r"^(?:net\s+)?cash\s+(?:provided|generated|used)\s+(?:by|in|from)\s+investing",
                      r"^net\s+cash\s+(?:from|used\s+in|used\s+for)\s+investing",
                      r"^(?:net\s+)?cash\s+(?:flows?\s+)?(?:from|used\s+in)\s+investing",
                      r"^net\s+cash\s+provided\s+by\s+\(used\s+for\)\s+investing",
-                     r"^net\s+cash\s+(?:provided\s+by\s+)?\(?used\s+in\)?\s+investing"],
+                     r"^net\s+cash\s+(?:provided\s+by\s+)?\(?used\s+in\)?\s+investing",
+                     r"^net\s+cash.*investing\s+activities"],
     "financing_cf": [r"^(?:net\s+)?cash\s+(?:provided|generated|used)\s+(?:by|in|from)\s+financing",
                      r"^net\s+cash\s+(?:from|used\s+in|used\s+for)\s+financing",
                      r"^(?:net\s+)?cash\s+(?:flows?\s+)?(?:from|used\s+in)\s+financing",
                      r"^net\s+cash\s+(?:provided|used).*?financing",
-                     r"^net\s+cash\s+provided\s+by\s+\(?used\s+in\)?\s+financing"],
+                     r"^net\s+cash\s+provided\s+by\s+\(?used\s+in\)?\s+financing",
+                     r"^net\s+cash.*financing\s+activities"],
     "capex": [r"^(?:purchases?\s+of|payments?\s+for|additions?\s+to)\s+property",
               r"^capital\s+expenditure",
               r"^purchase\s+of\s+property\s+and\s+equipment",
