@@ -161,10 +161,17 @@ def extract_company_name(text_plain, ticker):
     return ticker or "Unknown"
 
 def detect_currency(text):
-    t = text[:50000].upper()
-    for pat, cur in [(r"\bRMB\b|RENMINBI|RMB\d","RMB"),(r"REAIS|\bBRL\b|R\$","BRL"),
+    # Only check headers (first 5000 chars) for primary currency
+    header = text[:5000].upper()
+    for pat, cur in [(r"\bRMB\b|RENMINBI","RMB"),(r"REAIS|\bBRL\b|R\$","BRL"),
                      (r"\bHKD\b|HK\$","HKD"),(r"\bEUR(?:O|OS)?\b","EUR"),
-                     (r"\bGBP\b|POUND\s*STERLING","GBP"),(r"\bJPY\b|\bYEN\b","JPY")]:
+                     (r"\bGBP\b|POUND\s*STERLING","GBP"),(r"\bJPY\b","JPY")]:
+        if re.search(pat, header): return cur
+    # Broader check with strict patterns (avoid "yen" in body text)
+    t = text[:50000].upper()
+    for pat, cur in [(r"\bRMB\b|RENMINBI","RMB"),(r"REAIS|\bBRL\b","BRL"),
+                     (r"\bHKD\b|HK\$","HKD"),(r"\bGBP\b","GBP"),
+                     (r"DENOMINATED\s+IN.*?(?:YEN|JPY)|\bJPY\b","JPY")]:
         if re.search(pat, t): return cur
     return "USD"
 
@@ -212,6 +219,16 @@ def detect_table_unit(table, raw_html):
             for m in re.finditer(r"IN\s+MILLIONS", before): mp = m.start()
             if tp > mp >= 0 or (tp >= 0 and mp < 0): return "thousands(nearby)", 0.001
             if mp > tp >= 0 or (mp >= 0 and tp < 0): return "millions(nearby)", 1.0
+    except Exception: pass
+    # Method 3: Check preceding sibling/parent elements in DOM
+    try:
+        prev = table.find_previous(string=re.compile(r"[Ii]n\s+(?:millions|thousands|billions)"))
+        if prev:
+            ptxt = prev.strip().upper()
+            # Only use if it's close (within same section)
+            if "IN MILLIONS" in ptxt: return "millions(dom)", 1.0
+            if "IN THOUSANDS" in ptxt: return "thousands(dom)", 0.001
+            if "IN BILLIONS" in ptxt: return "billions(dom)", 1000.0
     except Exception: pass
     return "unknown", 0
 
@@ -265,8 +282,13 @@ def extract_numbers_from_row(cells):
     # Filter footnote refs: small first number + much larger subsequent numbers
     if len(raw_nums) >= 2 and 0 < abs(raw_nums[0]) < 50:
         max_rest = max(abs(v) for v in raw_nums[1:]) if raw_nums[1:] else 0
+        # Case 1: footnote tiny vs large financial numbers
         if max_rest > abs(raw_nums[0]) * 100:
             return raw_nums[1:]
+        # Case 2: footnote is integer, rest are small decimals (EPS)
+        if raw_nums[0] == int(raw_nums[0]) and all(abs(v) < 100 for v in raw_nums[1:]):
+            if any(v != int(v) for v in raw_nums[1:] if v != 0):
+                return raw_nums[1:]
     return raw_nums
 
 def build_row_label(cells):
@@ -277,7 +299,10 @@ def build_row_label(cells):
         v = parse_num(c)
         if v is not None and abs(v) > 50: break
         parts.append(c)
-    return " ".join(parts)
+    label = " ".join(parts)
+    # Strip trailing footnote references (small integers at end of label)
+    label = re.sub(r"\s+\d{1,2}$", "", label)
+    return label
 
 def find_row_value(rows, patterns, col_index=0):
     for pat in patterns:
@@ -417,11 +442,12 @@ def extract_shares_contextual(rows, col=0, table_text=""):
 
 # ═══════════ 标签模式 ═══════════
 IS_PATTERNS = {
-    "revenue": [r"^(?:total\s+)?(?:net\s+)?revenues?$", r"^(?:total\s+)?net\s+sales$",
-                r"^revenues?$", r"^(?:total\s+)?revenues?\s+from"],
+    "revenue": [r"^total\s+revenue(?:\s+and\s+income)?$", r"^total\s+(?:net\s+)?revenues?$",
+                r"^(?:total\s+)?(?:net\s+)?revenues?$", r"^(?:total\s+)?net\s+sales$",
+                r"^revenues?$"],
     "cost_of_revenue": [r"^(?:total\s+)?costs?\s+of\s+(?:revenues?|goods\s+sold|sales|services)",
                         r"^total\s+cost\s+of\s+revenue",
-                        r"^cost\s+of\s+services\$"],
+                        r"^cost\s+of\s+services"],
     "gross_profit": [r"^gross\s+profit$", r"^total\s+gross\s+profit$",
                      r"^gross\s+(?:profit|margin)\b"],
     "operating_expenses": [r"^total\s+(?:costs?\s+and\s+)?operating\s+expenses$",
@@ -453,15 +479,15 @@ IS_PATTERNS = {
 ],
     "rd_expense": [r"^research\s+and\s+development"],
     "sm_expense": [r"^sales\s+and\s+marketing", r"^selling\s+and\s+marketing",
-                   r"^selling\s+expenses?\$"],
+                   r"^selling\s+expenses?"],
     "ga_expense": [r"^general\s+and\s+administrative", r"^(?:selling,?\s+)?general\s+and\s+administrative",
-                   r"^administrative\s+expenses?\$"],
+                   r"^administrative\s+expenses?"],
     "sga_expense": [r"^selling,?\s+general\s+and\s+administrative"],
     "interest_income": [r"^interest\s+(?:income|and\s+investment\s+income)", r"^interest\s+income"],
     "interest_expense": [r"^interest\s+expense"],
     "income_tax": [r"^(?:\(?benefit\s+from\)?\s+)?(?:provision\s+for\s+)?income\s+tax",
                     r"^(?:provision\s+for|income\s+tax)", r"^income\s+tax\s+expense",
-                    r"^income\s+tax\s+and\s+social\s+contribution\$"],
+                    r"^income\s+tax\s+and\s+social\s+contribution"],
     "pretax_income": [r"^(?:income|loss|profit)\s+before\s+(?:income\s+)?tax",
                        r"^(?:income|profit)\s+before\s+(?:provision|income\s+tax)",
                        r"^profit\s+before\s+income\s+tax"],
@@ -650,7 +676,11 @@ def analyze_filing(filepath, ticker=""):
     def shares_to_m(v, in_thousands=None):
         if v is None or v <= 0: return None
         if in_thousands is True:
-            return round(v / 1000, 2)
+            result = round(v / 1000, 2)
+            # Sanity: if result > 100,000M (=100B), value is likely raw not thousands
+            if result > 100000:
+                return round(v / 1e6, 2)
+            return result
         elif in_thousands is False:
             if v > 1e6: return round(v / 1e6, 2)
             if v > 1e3: return round(v / 1e3, 2)
@@ -668,12 +698,23 @@ def analyze_filing(filepath, ticker=""):
         if sd and sd > 100: d.shares.diluted = shares_to_m(sd, sh_ik)
         if d.shares.weighted_avg or d.shares.diluted: break
     if not d.shares.weighted_avg and not d.shares.diluted:
-        for is_tbl in classified["IS"]:
-            sh_std_col = detect_latest_column(is_tbl["rows"])
-            shd = extract_from_table(is_tbl["rows"], SHARES_PATTERNS, col=sh_std_col)
+        # Build expanded table list: IS + BS + CF + any table with "weighted"/"shares"
+        _search = classified["IS"][:] + classified["BS"][:] + classified["CF"][:]
+        for ii, table in enumerate(all_tables):
+            txt = table.get_text(separator=" ", strip=True).lower()
+            if ("weighted" in txt and "share" in txt) or "earnings per share" in txt:
+                if not any(t["index"] == ii for t in _search):
+                    rr = parse_table_to_rows(table)
+                    ul2, um2 = detect_table_unit(table, html)
+                    _search.append({"index": ii, "rows": rr, "row_count": len(rr), "unit_label": ul2, "unit_mult": um2})
+        for stbl in _search:
+            sc = detect_latest_column(stbl["rows"])
+            tt = " ".join(" ".join(r) for r in stbl["rows"][:20])
+            ik = "thousand" in tt.lower()
+            shd = extract_from_table(stbl["rows"], SHARES_PATTERNS, col=sc)
             sb, sd = shd.get("shares_basic"), shd.get("shares_diluted")
-            if sb and sb > 100: d.shares.weighted_avg = shares_to_m(sb, sh_ik)
-            if sd and sd > 100: d.shares.diluted = shares_to_m(sd, sh_ik)
+            if sb and sb > 100: d.shares.weighted_avg = shares_to_m(sb, ik)
+            if sd and sd > 100: d.shares.diluted = shares_to_m(sd, ik)
             if d.shares.weighted_avg or d.shares.diluted: break
 
     # BS: merge ALL BS tables (some filings split Assets / Liabilities into separate tables)
@@ -718,7 +759,7 @@ def analyze_filing(filepath, ticker=""):
 
     # Step 5: 衍生
     if d.gross_profit is None and d.revenue and d.cost_of_revenue:
-        d.gross_profit = round(d.revenue - d.cost_of_revenue, 2)
+        d.gross_profit = round(d.revenue - abs(d.cost_of_revenue), 2)
     if d.free_cash_flow is None and d.operating_cf is not None and d.capex is not None:
         d.free_cash_flow = round(d.operating_cf - abs(d.capex), 2)
     # EBITDA = Operating Income + D&A (simplified)
