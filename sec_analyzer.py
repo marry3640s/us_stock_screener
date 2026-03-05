@@ -255,19 +255,25 @@ def classify_table(table):
 
 # ═══════════ 行级提取 ═══════════
 def extract_numbers_from_row(cells):
-    nums = []
+    raw_nums = []
     for c in cells:
         c = c.strip()
-        if not c or c in ("$", "RMB", "US$"): continue
+        if not c or c in ("$", "RMB", "US$", "R$"): continue
         v = parse_num(c)
-        if v is not None: nums.append(v)
-    return nums
+        if v is not None: raw_nums.append(v)
+    if not raw_nums: return raw_nums
+    # Filter footnote refs: small first number + much larger subsequent numbers
+    if len(raw_nums) >= 2 and 0 < abs(raw_nums[0]) < 50:
+        max_rest = max(abs(v) for v in raw_nums[1:]) if raw_nums[1:] else 0
+        if max_rest > abs(raw_nums[0]) * 100:
+            return raw_nums[1:]
+    return raw_nums
 
 def build_row_label(cells):
     parts = []
     for c in cells[:6]:
         c = c.strip()
-        if not c or c in ("$", "RMB", "US$"): continue
+        if not c or c in ("$", "RMB", "US$", "R$"): continue
         v = parse_num(c)
         if v is not None and abs(v) > 50: break
         parts.append(c)
@@ -414,7 +420,8 @@ IS_PATTERNS = {
     "revenue": [r"^(?:total\s+)?(?:net\s+)?revenues?$", r"^(?:total\s+)?net\s+sales$",
                 r"^revenues?$", r"^(?:total\s+)?revenues?\s+from"],
     "cost_of_revenue": [r"^(?:total\s+)?costs?\s+of\s+(?:revenues?|goods\s+sold|sales|services)",
-                        r"^total\s+cost\s+of\s+revenue"],
+                        r"^total\s+cost\s+of\s+revenue",
+                        r"^cost\s+of\s+services\$"],
     "gross_profit": [r"^gross\s+profit$", r"^total\s+gross\s+profit$",
                      r"^gross\s+(?:profit|margin)\b"],
     "operating_expenses": [r"^total\s+(?:costs?\s+and\s+)?operating\s+expenses$",
@@ -428,35 +435,43 @@ IS_PATTERNS = {
                    r"^net\s+(?:income|loss)\s+attributable\s+to",
                    r"^(?:profit|loss)\s+for\s+the\s+(?:year|period|quarter)",
                    r"^net\s+(?:income|loss|earnings?|profit)",
+                   r"^net\s+(?:income|loss)\s+for\s+the\s+(?:period|quarter|year)",
                    r"^(?:profit|loss)\s+attributable\s+to"],
     "eps_basic": [r"(?:basic|—\s*basic)\s*(?:net\s+)?(?:income|earnings?|loss|profit)\s*per\s*(?:share|ads|ordinary|common)",
+                  r"^basic\s+earnings?\s+per\s+(?:common\s+)?share",
                   r"(?:net\s+)?(?:income|earnings?)\s+per\s+(?:share|ads|ordinary).*?basic",
                   r"basic\s+(?:income|earnings?)\s+per\s+(?:common\s+)?(?:share|ads|ordinary)",
                   r"per\s+(?:ordinary\s+)?share.*?basic",
                   r"per\s+ADS.*?basic",
 ],
     "eps_diluted": [r"(?:diluted|—\s*diluted)\s*(?:net\s+)?(?:income|earnings?|loss|profit)\s*per\s*(?:share|ads|ordinary|common)",
+                    r"^diluted\s+earnings?\s+per\s+(?:common\s+)?share",
                     r"(?:net\s+)?(?:income|earnings?)\s+per\s+(?:share|ads|ordinary).*?diluted",
                     r"diluted\s+(?:income|earnings?)\s+per\s+(?:common\s+)?(?:share|ads|ordinary)",
                     r"per\s+(?:ordinary\s+)?share.*?diluted",
                     r"per\s+ADS.*?diluted",
 ],
     "rd_expense": [r"^research\s+and\s+development"],
-    "sm_expense": [r"^sales\s+and\s+marketing", r"^selling\s+and\s+marketing"],
-    "ga_expense": [r"^general\s+and\s+administrative", r"^(?:selling,?\s+)?general\s+and\s+administrative"],
+    "sm_expense": [r"^sales\s+and\s+marketing", r"^selling\s+and\s+marketing",
+                   r"^selling\s+expenses?\$"],
+    "ga_expense": [r"^general\s+and\s+administrative", r"^(?:selling,?\s+)?general\s+and\s+administrative",
+                   r"^administrative\s+expenses?\$"],
     "sga_expense": [r"^selling,?\s+general\s+and\s+administrative"],
     "interest_income": [r"^interest\s+(?:income|and\s+investment\s+income)", r"^interest\s+income"],
     "interest_expense": [r"^interest\s+expense"],
     "income_tax": [r"^(?:\(?benefit\s+from\)?\s+)?(?:provision\s+for\s+)?income\s+tax",
-                    r"^(?:provision\s+for|income\s+tax)", r"^income\s+tax\s+expense"],
+                    r"^(?:provision\s+for|income\s+tax)", r"^income\s+tax\s+expense",
+                    r"^income\s+tax\s+and\s+social\s+contribution\$"],
     "pretax_income": [r"^(?:income|loss|profit)\s+before\s+(?:income\s+)?tax",
-                       r"^(?:income|profit)\s+before\s+(?:provision|income\s+tax)"],
+                       r"^(?:income|profit)\s+before\s+(?:provision|income\s+tax)",
+                       r"^profit\s+before\s+income\s+tax"],
 }
 SHARES_PATTERNS = {
     "shares_basic": [r"weighted[\s-]*average.*?(?:basic|computing|outstanding|shares)",
                      r"denominator.*?basic",
                      r"(?:basic|ordinary)\s+(?:weighted|shares)",
-                     r"shares\s+used\s+to\s+compute\s+basic"],
+                     r"shares\s+used\s+to\s+compute\s+basic",
+                     r"weighted\s+average\s+number\s+of\s+(?:outstanding\s+)?(?:common\s+)?shares"],
     "shares_diluted": [r"denominator.*?dilut(?:ive|ed).*?(?:weighted|share)",
                        r"weighted[\s-]*average.*?dilut",
                        r"diluted\s+(?:weighted|shares)",
@@ -495,21 +510,25 @@ BS_PATTERNS = {
 CF_PATTERNS = {
     "operating_cf": [r"^(?:net\s+)?cash\s+(?:provided|generated|used)\s+(?:by|in|from)\s+operating",
                      r"^net\s+cash\s+(?:from|used\s+in|used\s+for)\s+operating",
-                     r"^(?:net\s+)?cash\s+(?:flows?\s+)?(?:from|provided\s+by|generated\s+from)\s+operating"],
+                     r"^(?:net\s+)?cash\s+(?:flows?\s+)?(?:from|provided\s+by|generated\s+from)\s+operating",
+                     r"^net\s+cash\s+provided\s+by\s+\(?used\s+in\)?\s+operating"],
     "investing_cf": [r"^(?:net\s+)?cash\s+(?:provided|generated|used)\s+(?:by|in|from)\s+investing",
                      r"^net\s+cash\s+(?:from|used\s+in|used\s+for)\s+investing",
                      r"^(?:net\s+)?cash\s+(?:flows?\s+)?(?:from|used\s+in)\s+investing",
-                     r"^net\s+cash\s+provided\s+by\s+\(used\s+for\)\s+investing"],
+                     r"^net\s+cash\s+provided\s+by\s+\(used\s+for\)\s+investing",
+                     r"^net\s+cash\s+(?:provided\s+by\s+)?\(?used\s+in\)?\s+investing"],
     "financing_cf": [r"^(?:net\s+)?cash\s+(?:provided|generated|used)\s+(?:by|in|from)\s+financing",
                      r"^net\s+cash\s+(?:from|used\s+in|used\s+for)\s+financing",
                      r"^(?:net\s+)?cash\s+(?:flows?\s+)?(?:from|used\s+in)\s+financing",
-                     r"^net\s+cash\s+(?:provided|used).*?financing"],
+                     r"^net\s+cash\s+(?:provided|used).*?financing",
+                     r"^net\s+cash\s+provided\s+by\s+\(?used\s+in\)?\s+financing"],
     "capex": [r"^(?:purchases?\s+of|payments?\s+for|additions?\s+to)\s+property",
               r"^capital\s+expenditure",
               r"^purchase\s+of\s+property\s+and\s+equipment",
               r"^(?:purchases?\s+of|payments?\s+for)\s+(?:fixed|tangible)\s+assets"],
     "depreciation_amortization": [r"^depreciation"],
-    "stock_based_compensation": [r"^stock[\s-]*based\s+compensation", r"^share[\s-]*based\s+compensation"],
+    "stock_based_compensation": [r"^stock[\s-]*based\s+compensation", r"^share[\s-]*based\s+compensation",
+                               r"^share\s+based\s+long[\s-]*term\s+incentive"],
     "acquisitions": [r"^acquisitions?(?:,|\s+of|\s+net)"],
     "net_change_in_cash": [r"^(?:net\s+)?(?:increase|decrease)\s+in\s+cash"],
     "cash_end_of_period": [r"^cash.*?(?:end\s+of|at\s+end)"],
