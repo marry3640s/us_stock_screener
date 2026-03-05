@@ -44,10 +44,41 @@ class FilingData:
     operating_cf: Optional[float] = None; investing_cf: Optional[float] = None
     financing_cf: Optional[float] = None; capex: Optional[float] = None
     free_cash_flow: Optional[float] = None
+    # IS detail
+    rd_expense: Optional[float] = None
+    sga_expense: Optional[float] = None
+    sm_expense: Optional[float] = None
+    ga_expense: Optional[float] = None
+    interest_income: Optional[float] = None
+    interest_expense: Optional[float] = None
+    income_tax: Optional[float] = None
+    pretax_income: Optional[float] = None
+    ebitda: Optional[float] = None
+    # BS detail
+    short_term_investments: Optional[float] = None
+    accounts_receivable: Optional[float] = None
+    inventory: Optional[float] = None
+    goodwill: Optional[float] = None
+    total_non_current_assets: Optional[float] = None
+    accounts_payable: Optional[float] = None
+    deferred_revenue: Optional[float] = None
+    total_non_current_liabilities: Optional[float] = None
+    additional_paid_in_capital: Optional[float] = None
+    # CF detail
+    depreciation_amortization: Optional[float] = None
+    stock_based_compensation: Optional[float] = None
+    change_in_working_capital: Optional[float] = None
+    net_change_in_cash: Optional[float] = None
+    cash_end_of_period: Optional[float] = None
+    acquisitions: Optional[float] = None
+    # Shares & Ratios
     shares: SharesInfo = field(default_factory=SharesInfo)
     gross_margin: Optional[float] = None; operating_margin: Optional[float] = None
     net_margin: Optional[float] = None; current_ratio: Optional[float] = None
     debt_to_equity: Optional[float] = None; roe: Optional[float] = None
+    roa: Optional[float] = None
+    asset_turnover: Optional[float] = None
+    ebitda_margin: Optional[float] = None
 
 # ═══════════ 数字解析 ═══════════
 def parse_num(text):
@@ -409,6 +440,16 @@ IS_PATTERNS = {
                     r"per\s+(?:ordinary\s+)?share.*?diluted",
                     r"per\s+ADS.*?diluted",
 ],
+    "rd_expense": [r"^research\s+and\s+development"],
+    "sm_expense": [r"^sales\s+and\s+marketing", r"^selling\s+and\s+marketing"],
+    "ga_expense": [r"^general\s+and\s+administrative", r"^(?:selling,?\s+)?general\s+and\s+administrative"],
+    "sga_expense": [r"^selling,?\s+general\s+and\s+administrative"],
+    "interest_income": [r"^interest\s+(?:income|and\s+investment\s+income)", r"^interest\s+income"],
+    "interest_expense": [r"^interest\s+expense"],
+    "income_tax": [r"^(?:\(?benefit\s+from\)?\s+)?(?:provision\s+for\s+)?income\s+tax",
+                    r"^(?:provision\s+for|income\s+tax)", r"^income\s+tax\s+expense"],
+    "pretax_income": [r"^(?:income|loss|profit)\s+before\s+(?:income\s+)?tax",
+                       r"^(?:income|profit)\s+before\s+(?:provision|income\s+tax)"],
 }
 SHARES_PATTERNS = {
     "shares_basic": [r"weighted[\s-]*average.*?(?:basic|computing|outstanding|shares)",
@@ -536,6 +577,14 @@ def analyze_filing(filepath, ticker=""):
         d.net_income = ap(isd["net_income"], best_is)
         d.eps_basic = ap(isd["eps_basic"], best_is, is_eps=True)
         d.eps_diluted = ap(isd["eps_diluted"], best_is, is_eps=True)
+        d.rd_expense = ap(isd.get("rd_expense"), best_is)
+        d.sm_expense = ap(isd.get("sm_expense"), best_is)
+        d.ga_expense = ap(isd.get("ga_expense"), best_is)
+        d.sga_expense = ap(isd.get("sga_expense"), best_is)
+        d.interest_income = ap(isd.get("interest_income"), best_is)
+        d.interest_expense = ap(isd.get("interest_expense"), best_is)
+        d.income_tax = ap(isd.get("income_tax"), best_is)
+        d.pretax_income = ap(isd.get("pretax_income"), best_is)
         d.unit_label = best_is["unit_label"] if best_is["unit_mult"] > 0 else gl
         d.unit_multiplier = _um(best_is)
 
@@ -592,7 +641,10 @@ def analyze_filing(filepath, ticker=""):
     if best_cf:
         cf_col = detect_latest_column(best_cf["rows"])
         cfd = extract_from_table(best_cf["rows"], CF_PATTERNS, col=cf_col)
-        for k in CF_PATTERNS: setattr(d, k, ap(cfd[k], best_cf))
+        for k in CF_PATTERNS:
+            val = ap(cfd[k], best_cf)
+            if val is not None:
+                setattr(d, k, val)
 
     # Step 4: 自动推断单位
     if d.unit_multiplier == 0:
@@ -606,7 +658,14 @@ def analyze_filing(filepath, ticker=""):
                          "operating_income","net_income","total_assets","current_assets",
                          "cash","total_liabilities","current_liabilities","long_term_debt",
                          "total_equity","retained_earnings","operating_cf","investing_cf",
-                         "financing_cf","capex"]:
+                         "financing_cf","capex",
+                         "rd_expense","sm_expense","ga_expense","sga_expense",
+                         "interest_income","interest_expense","income_tax","pretax_income",
+                         "short_term_investments","accounts_receivable","inventory","goodwill",
+                         "total_non_current_assets","accounts_payable","deferred_revenue",
+                         "total_non_current_liabilities","additional_paid_in_capital",
+                         "depreciation_amortization","stock_based_compensation",
+                         "net_change_in_cash","cash_end_of_period","acquisitions"]:
                 v = getattr(d, attr)
                 if v is not None: setattr(d, attr, round(v * mult, 2))
 
@@ -615,6 +674,13 @@ def analyze_filing(filepath, ticker=""):
         d.gross_profit = round(d.revenue - d.cost_of_revenue, 2)
     if d.free_cash_flow is None and d.operating_cf is not None and d.capex is not None:
         d.free_cash_flow = round(d.operating_cf - abs(d.capex), 2)
+    # EBITDA = Operating Income + D&A (simplified)
+    if d.ebitda is None and d.operating_income is not None and d.depreciation_amortization is not None:
+        d.ebitda = round(d.operating_income + abs(d.depreciation_amortization), 2)
+    # SGA = S&M + G&A if not directly available
+    if d.sga_expense is None and d.sm_expense and d.ga_expense:
+        d.sga_expense = round((abs(d.sm_expense) + abs(d.ga_expense)), 2)
+        if d.sm_expense < 0: d.sga_expense = -d.sga_expense
     ts = extract_shares_from_text(text)
     if not d.shares.common: d.shares.common = ts.common
     if not d.shares.weighted_avg: d.shares.weighted_avg = ts.weighted_avg
@@ -635,6 +701,12 @@ def analyze_filing(filepath, ticker=""):
         d.debt_to_equity = round(d.total_liabilities / d.total_equity, 2)
     if d.net_income and d.total_equity and d.total_equity != 0:
         d.roe = round(d.net_income / d.total_equity * 100, 2)
+    if d.net_income and d.total_assets and d.total_assets != 0:
+        d.roa = round(d.net_income / d.total_assets * 100, 2)
+    if d.revenue and d.total_assets and d.total_assets != 0:
+        d.asset_turnover = round(d.revenue / d.total_assets, 2)
+    if d.ebitda and d.revenue and d.revenue != 0:
+        d.ebitda_margin = round(d.ebitda / d.revenue * 100, 2)
 
     fields = [d.revenue, d.gross_profit, d.operating_income, d.net_income,
               d.total_assets, d.total_equity, d.operating_cf, d.shares.weighted_avg or d.shares.common]
@@ -664,17 +736,23 @@ def print_summary(results):
         c = d.currency
         print(f"\n+-- {d.ticker} -- {d.filing_type} -- {d.company_name}")
         print(f"|  Date: {d.filing_date}  |  Period: {d.fiscal_period}  |  {c}, {d.unit_label}")
-        print(f"|  Revenue: {fmt(d.revenue,c):>14s}  Gross: {fmt(d.gross_profit,c):>14s}  OpInc: {fmt(d.operating_income,c):>14s}  Net: {fmt(d.net_income,c):>14s}")
+        print(f"|  Revenue: {fmt(d.revenue,c):>14s}  COGS: {fmt(d.cost_of_revenue,c):>14s}  Gross: {fmt(d.gross_profit,c):>14s}  OpInc: {fmt(d.operating_income,c):>14s}")
+        print(f"|  R&D: {fmt(d.rd_expense,c):>17s}  S&M: {fmt(d.sm_expense,c):>15s}  G&A: {fmt(d.ga_expense,c):>15s}  SGA: {fmt(d.sga_expense,c):>15s}")
+        print(f"|  PreTax: {fmt(d.pretax_income,c):>14s}  Tax: {fmt(d.income_tax,c):>14s}  Net: {fmt(d.net_income,c):>14s}  EBITDA: {fmt(d.ebitda,c):>13s}")
         eb = d.eps_basic if d.eps_basic is not None else "---"
         ed = d.eps_diluted if d.eps_diluted is not None else "---"
-        print(f"|  EPS: {eb} / {ed}")
-        print(f"|  Assets: {fmt(d.total_assets,c):>14s}  Liab: {fmt(d.total_liabilities,c):>14s}  Equity: {fmt(d.total_equity,c):>14s}  Cash: {fmt(d.cash,c):>14s}")
+        print(f"|  EPS: {eb} / {ed}  IntInc: {fmt(d.interest_income,c)}")
+        print(f"|  Assets: {fmt(d.total_assets,c):>14s}  CurAst: {fmt(d.current_assets,c):>13s}  Liab: {fmt(d.total_liabilities,c):>13s}  CurLiab: {fmt(d.current_liabilities,c):>12s}")
+        print(f"|  Equity: {fmt(d.total_equity,c):>14s}  Cash: {fmt(d.cash,c):>15s}  STInv: {fmt(d.short_term_investments,c):>13s}  Goodwill: {fmt(d.goodwill,c):>11s}")
+        print(f"|  AR: {fmt(d.accounts_receivable,c):>18s}  AP: {fmt(d.accounts_payable,c):>17s}  DefRev: {fmt(d.deferred_revenue,c):>13s}  RetEarn: {fmt(d.retained_earnings,c):>11s}")
         print(f"|  OpCF: {fmt(d.operating_cf,c):>16s}  InvCF: {fmt(d.investing_cf,c):>13s}  FinCF: {fmt(d.financing_cf,c):>13s}  FCF: {fmt(d.free_cash_flow,c):>13s}")
+        print(f"|  D&A: {fmt(d.depreciation_amortization,c):>17s}  SBC: {fmt(d.stock_based_compensation,c):>15s}  CapEx: {fmt(d.capex,c):>14s}  Acq: {fmt(d.acquisitions,c):>14s}")
         print(f"|  Shares: {fs(d.shares.common):>14s}  WtdAvg: {fs(d.shares.weighted_avg):>12s}  Diluted: {fs(d.shares.diluted):>12s}", end="")
         if d.shares.ads_ratio: print(f"  ({d.shares.ads_ratio})", end="")
         print()
         cr, de = d.current_ratio or "---", d.debt_to_equity or "---"
-        print(f"|  Gross: {pct(d.gross_margin):>7s}  Op: {pct(d.operating_margin):>7s}  Net: {pct(d.net_margin):>7s}  ROE: {pct(d.roe):>7s}  Cur: {str(cr):>5}  D/E: {str(de):>5}")
+        print(f"|  Gross: {pct(d.gross_margin):>7s}  Op: {pct(d.operating_margin):>7s}  Net: {pct(d.net_margin):>7s}  EBITDA: {pct(d.ebitda_margin):>6s}")
+        print(f"|  ROE: {pct(d.roe):>8s}  ROA: {pct(d.roa):>8s}  Cur: {str(cr):>5}  D/E: {str(de):>5}  ATO: {str(d.asset_turnover or '---'):>5}")
         print(f"+{'-'*93}")
     print()
 
@@ -690,11 +768,17 @@ def write_excel(results, output_path):
     alt = PatternFill("solid", fgColor="F3F4F6")
     bdr = Border(bottom=Side(style="thin", color="E5E7EB"))
     cols = [("Ticker",10),("Type",8),("Company",28),("Ccy",6),("Unit",18),("Date",14),("Period",16),
-            ("Revenue(M)",14),("Gross(M)",12),("OpInc(M)",12),("NetInc(M)",12),("EPS_B",8),("EPS_D",8),
-            ("Assets(M)",14),("Cash(M)",12),("Liab(M)",12),("Equity(M)",12),("LTDebt(M)",12),
-            ("OpCF(M)",12),("CapEx(M)",10),("FCF(M)",12),
+            ("Revenue(M)",14),("COGS(M)",12),("Gross(M)",12),("R&D(M)",11),("S&M(M)",11),("G&A(M)",11),
+            ("OpEx(M)",12),("OpInc(M)",12),("PreTax(M)",12),("Tax(M)",10),("NetInc(M)",12),
+            ("EPS_B",8),("EPS_D",8),("EBITDA(M)",12),
+            ("Assets(M)",14),("CurAst(M)",13),("Cash(M)",12),("STInv(M)",12),("AR(M)",10),
+            ("Goodwill(M)",11),("Liab(M)",12),("CurLiab(M)",12),("LTDebt(M)",12),
+            ("DefRev(M)",11),("AP(M)",10),("Equity(M)",12),("RetEarn(M)",12),("APIC(M)",11),
+            ("OpCF(M)",12),("InvCF(M)",12),("FinCF(M)",12),("CapEx(M)",10),("FCF(M)",12),
+            ("D&A(M)",10),("SBC(M)",10),("Acq(M)",10),
             ("Shares(M)",11),("WtdAvg(M)",11),("Diluted(M)",11),
-            ("Gross%",8),("Op%",7),("Net%",7),("ROE%",7),("CurRatio",8),("D/E",7)]
+            ("Gross%",8),("Op%",7),("Net%",7),("EBITDA%",8),("ROE%",7),("ROA%",7),
+            ("CurRatio",8),("D/E",7),("ATO",6)]
     for ci,(n,w) in enumerate(cols,1):
         cell = ws.cell(row=1, column=ci, value=n); cell.font = hf; cell.fill = hfill
         cell.alignment = Alignment(horizontal="center", wrap_text=True)
@@ -702,11 +786,17 @@ def write_excel(results, output_path):
     ws.freeze_panes = "A2"
     for ri, d in enumerate(results, 2):
         row = [d.ticker,d.filing_type,d.company_name,d.currency,d.unit_label,d.filing_date,d.fiscal_period,
-               d.revenue,d.gross_profit,d.operating_income,d.net_income,d.eps_basic,d.eps_diluted,
-               d.total_assets,d.cash,d.total_liabilities,d.total_equity,d.long_term_debt,
-               d.operating_cf,d.capex,d.free_cash_flow,
+               d.revenue,d.cost_of_revenue,d.gross_profit,d.rd_expense,d.sm_expense,d.ga_expense,
+               d.operating_expenses,d.operating_income,d.pretax_income,d.income_tax,d.net_income,
+               d.eps_basic,d.eps_diluted,d.ebitda,
+               d.total_assets,d.current_assets,d.cash,d.short_term_investments,d.accounts_receivable,
+               d.goodwill,d.total_liabilities,d.current_liabilities,d.long_term_debt,
+               d.deferred_revenue,d.accounts_payable,d.total_equity,d.retained_earnings,d.additional_paid_in_capital,
+               d.operating_cf,d.investing_cf,d.financing_cf,d.capex,d.free_cash_flow,
+               d.depreciation_amortization,d.stock_based_compensation,d.acquisitions,
                d.shares.common,d.shares.weighted_avg,d.shares.diluted,
-               d.gross_margin,d.operating_margin,d.net_margin,d.roe,d.current_ratio,d.debt_to_equity]
+               d.gross_margin,d.operating_margin,d.net_margin,d.ebitda_margin,d.roe,d.roa,
+               d.current_ratio,d.debt_to_equity,d.asset_turnover]
         for ci, val in enumerate(row, 1):
             cell = ws.cell(row=ri, column=ci, value=val); cell.border = bdr
             cell.font = Font(name="Arial", size=10)
@@ -718,21 +808,31 @@ def write_excel(results, output_path):
 
 def write_csv(results, output_path):
     h = ["Ticker","Type","Company","Ccy","Unit","Date","Period",
-         "Revenue(M)","Gross(M)","OpInc(M)","NetInc(M)","EPS_B","EPS_D",
-         "Assets(M)","Cash(M)","Liab(M)","Equity(M)","LTDebt(M)",
-         "OpCF(M)","CapEx(M)","FCF(M)","Shares(M)","WtdAvg(M)","Diluted(M)",
-         "Gross%","Op%","Net%","ROE%","CurRatio","D/E"]
+         "Revenue(M)","COGS(M)","Gross(M)","R&D(M)","S&M(M)","G&A(M)",
+         "OpEx(M)","OpInc(M)","PreTax(M)","Tax(M)","NetInc(M)","EPS_B","EPS_D","EBITDA(M)",
+         "Assets(M)","CurAssets(M)","Cash(M)","STInv(M)","AR(M)","Goodwill(M)",
+         "Liab(M)","CurLiab(M)","LTDebt(M)","DefRev(M)","AP(M)",
+         "Equity(M)","RetEarn(M)","APIC(M)",
+         "OpCF(M)","InvCF(M)","FinCF(M)","CapEx(M)","FCF(M)","D&A(M)","SBC(M)","Acq(M)",
+         "Shares(M)","WtdAvg(M)","Diluted(M)",
+         "Gross%","Op%","Net%","EBITDA%","ROE%","ROA%","CurRatio","D/E","ATO"]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f); w.writerow(h)
         for d in results:
             w.writerow([d.ticker,d.filing_type,d.company_name,d.currency,d.unit_label,
                 d.filing_date,d.fiscal_period,
-                d.revenue,d.gross_profit,d.operating_income,d.net_income,d.eps_basic,d.eps_diluted,
-                d.total_assets,d.cash,d.total_liabilities,d.total_equity,d.long_term_debt,
-                d.operating_cf,d.capex,d.free_cash_flow,
+                d.revenue,d.cost_of_revenue,d.gross_profit,d.rd_expense,d.sm_expense,d.ga_expense,
+                d.operating_expenses,d.operating_income,d.pretax_income,d.income_tax,d.net_income,
+                d.eps_basic,d.eps_diluted,d.ebitda,
+                d.total_assets,d.current_assets,d.cash,d.short_term_investments,d.accounts_receivable,
+                d.goodwill,d.total_liabilities,d.current_liabilities,d.long_term_debt,
+                d.deferred_revenue,d.accounts_payable,d.total_equity,d.retained_earnings,d.additional_paid_in_capital,
+                d.operating_cf,d.investing_cf,d.financing_cf,d.capex,d.free_cash_flow,
+                d.depreciation_amortization,d.stock_based_compensation,d.acquisitions,
                 d.shares.common,d.shares.weighted_avg,d.shares.diluted,
-                d.gross_margin,d.operating_margin,d.net_margin,d.roe,d.current_ratio,d.debt_to_equity])
+                d.gross_margin,d.operating_margin,d.net_margin,d.ebitda_margin,d.roe,d.roa,
+                d.current_ratio,d.debt_to_equity,d.asset_turnover])
     print(f"\nCSV saved: {output_path}")
 
 # ═══════════ CLI ═══════════
