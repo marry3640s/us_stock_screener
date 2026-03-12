@@ -251,7 +251,7 @@ def parse_6k_from_master(cik: str) -> list:
 
 
 # ─── 财务 6-K 关键词判断 ──────────────────────────────────────────────────────
-_SCAN_BYTES = 300 * 1024   # 读取前 300KB 做关键词匹配
+_SCAN_BYTES = 1024 * 1024  # 读取前 1MB 做关键词匹配
 
 _INCOME_RE = re.compile(
     r"(total revenue|net revenue|net sales|gross profit|operating income|"
@@ -265,23 +265,81 @@ _BALANCE_RE = re.compile(
     r"current assets|current liabilities)",
     re.IGNORECASE,
 )
+# 从 SGML .txt 中提取 EX-99.1 附件文件名
+_EX99_RE = re.compile(
+    r"<TYPE>EX-99\.1.*?<FILENAME>([^\s<]+)",
+    re.IGNORECASE | re.DOTALL,
+)
 
-def is_financial_6k(save_path: Path) -> bool:
+def _has_financial_keywords(text: str) -> bool:
+    """收入表或资产负债表关键词命中任意一类即返回 True。"""
+    return bool(_INCOME_RE.search(text)) or bool(_BALANCE_RE.search(text))
+
+
+def is_financial_6k(save_path: Path, txt_url: str) -> bool:
     """
-    读取已下载 .txt 文件的前 300KB，
-    同时命中收入表和资产负债表关键词则视为财务季报。
+    判断一个 6-K 是否为财务季报：
+      1. 读取 .txt 主文件前 300KB，直接做关键词匹配
+      2. 若未命中，从 .txt 中提取 EX-99.1 附件文件名，
+         下载附件再做关键词匹配（如 BABA 的 ex99-1.htm）
+      3. 任一命中即返回 True，同时返回实际财报文件路径
+    返回 (is_financial: bool, report_path: Path)
+    report_path 为实际保存的财报文件（可能是 .txt 或附件 .htm）
     """
     try:
         with open(save_path, "rb") as f:
             raw = f.read(_SCAN_BYTES)
         text = raw.decode("latin-1", errors="ignore")
-        hit_income  = bool(_INCOME_RE.search(text))
-        hit_balance = bool(_BALANCE_RE.search(text))
-        log.debug(f"  关键词: 收入表={hit_income}, 资产负债表={hit_balance}")
-        return hit_income and hit_balance
+
+        # 先检查主文件
+        if _has_financial_keywords(text):
+            log.debug(f"  主文件关键词命中")
+            return True, save_path
+
+        # 主文件未命中，找 EX-99.1 附件
+        m = _EX99_RE.search(text)
+        if not m:
+            log.debug(f"  主文件未命中，也无 EX-99.1 附件")
+            return False, save_path
+
+        ex_filename = m.group(1).strip()
+        # 构造附件 URL：同目录下
+        base_url  = txt_url.rsplit("/", 1)[0]
+        ex_url    = f"{base_url}/{ex_filename}"
+        ex_path   = save_path.parent / ex_filename
+        log.debug(f"  主文件未命中，尝试 EX-99.1: {ex_filename}")
+
+        for attempt in range(1, MAX_RETRY + 1):
+            try:
+                resp = _get(ex_url, timeout=60, stream=True)
+                resp.raise_for_status()
+                ex_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(ex_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        f.write(chunk)
+                break
+            except Exception as e:
+                if attempt < MAX_RETRY:
+                    time.sleep(RETRY_DELAY)
+                else:
+                    log.debug(f"  EX-99.1 下载失败: {e}")
+                    return False, save_path
+
+        with open(ex_path, "rb") as f:
+            ex_raw = f.read(_SCAN_BYTES)
+        ex_text = ex_raw.decode("latin-1", errors="ignore")
+
+        if _has_financial_keywords(ex_text):
+            log.debug(f"  EX-99.1 关键词命中: {ex_filename}")
+            return True, ex_path
+        else:
+            log.debug(f"  EX-99.1 也未命中关键词")
+            ex_path.unlink(missing_ok=True)
+            return False, save_path
+
     except Exception as e:
         log.debug(f"  关键词判断失败: {e}")
-        return False
+        return False, save_path
 
 
 # ─── CIK / submissions ────────────────────────────────────────────────────────
@@ -391,9 +449,13 @@ def find_financial_6k(ticker: str, cik: str) -> Optional[dict]:
         if not ok:
             continue
 
-        if is_financial_6k(save_path):
-            log.info(f"[{ticker}] 财务 6-K: {f['filingDate']} ({save_path.stat().st_size//1024}KB)")
-            f["save_path"] = save_path
+        is_fin, report_path = is_financial_6k(save_path, f["txt_url"])
+        if is_fin:
+            log.info(f"[{ticker}] 财务 6-K: {f['filingDate']} ({report_path.stat().st_size//1024}KB) → {report_path.name}")
+            # 若实际财报是附件（ex99-1.htm），删掉已无用的 .txt 封面
+            if report_path != save_path:
+                save_path.unlink(missing_ok=True)
+            f["save_path"] = report_path
             f["form"] = "6-K"
             return f
         else:
