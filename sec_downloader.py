@@ -7,8 +7,8 @@ SEC 财报下载器（多线程 + 双层断点续存版）
     1. 扫描 master.idx，找该公司所有 6-K
        master.idx 格式：CIK|Company|Form|Date|edgar/data/{CIK}/{accnodash}.txt
        那个 .txt 文件本身就是财报内容（SGML 打包格式）
-    2. 按日期从新到旧，对每个 .txt 发 HEAD 请求检查文件大小
-    3. 大于 MIN_6K_BYTES（200KB）的视为财务 6-K
+    2. 按日期从新到旧，逐一下载 .txt，读取前 300KB 用关键词判断是否含财务报表
+    3. 命中则保留，否则删除继续找下一条
     4. 与最新 20-F 比日期，谁新下谁
 
 多线程改造说明：
@@ -43,7 +43,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 # ─── 配置 ──────────────────────────────────────────────────────────────────────
-TICKER_FILE   = "all_tickers.txt"
+TICKER_FILE   = "tickers.txt"
 OUTPUT_DIR    = "sec-data"
 
 # 并发 ticker 数量（建议 3~8，过高会被 SEC 限流）
@@ -56,9 +56,6 @@ MAX_RETRY     = 3
 RETRY_DELAY   = 5.0
 
 USER_AGENT = "MyResearchBot contact@example.com"   # ← 改成你的邮箱
-
-# 6-K 财务报表大小阈值：master.idx 的 .txt 文件超过此值视为财务 6-K
-MIN_6K_BYTES = 200 * 1024   # 200 KB
 
 # 扫描最近几个季度的 master.idx
 IDX_QUARTERS = 4
@@ -253,29 +250,38 @@ def parse_6k_from_master(cik: str) -> list:
     return results
 
 
-# ─── 检查文件大小 ─────────────────────────────────────────────────────────────
-def get_file_size(url: str) -> Optional[int]:
+# ─── 财务 6-K 关键词判断 ──────────────────────────────────────────────────────
+_SCAN_BYTES = 300 * 1024   # 读取前 300KB 做关键词匹配
+
+_INCOME_RE = re.compile(
+    r"(total revenue|net revenue|net sales|gross profit|operating income|"
+    r"net income|net loss|earnings per share|loss per share|"
+    r"consolidated statements? of (operations|income|earnings|comprehensive))",
+    re.IGNORECASE,
+)
+_BALANCE_RE = re.compile(
+    r"(total assets|total liabilities|shareholders.{0,10}equity|"
+    r"stockholders.{0,10}equity|consolidated balance sheet|"
+    r"current assets|current liabilities)",
+    re.IGNORECASE,
+)
+
+def is_financial_6k(save_path: Path) -> bool:
     """
-    Streaming GET，读到超过 MIN_6K_BYTES 即提前返回，节省流量。
+    读取已下载 .txt 文件的前 300KB，
+    同时命中收入表和资产负债表关键词则视为财务季报。
     """
-    for attempt in range(1, MAX_RETRY + 1):
-        try:
-            resp = _get(url, timeout=30, stream=True)
-            resp.raise_for_status()
-            total = 0
-            for chunk in resp.iter_content(chunk_size=65536):
-                total += len(chunk)
-                if total >= MIN_6K_BYTES:
-                    resp.close()
-                    return total
-            return total
-        except Exception as e:
-            if attempt < MAX_RETRY:
-                time.sleep(RETRY_DELAY)
-            else:
-                log.debug(f"GET size 失败 {url}: {e}")
-                return None
-    return None
+    try:
+        with open(save_path, "rb") as f:
+            raw = f.read(_SCAN_BYTES)
+        text = raw.decode("latin-1", errors="ignore")
+        hit_income  = bool(_INCOME_RE.search(text))
+        hit_balance = bool(_BALANCE_RE.search(text))
+        log.debug(f"  关键词: 收入表={hit_income}, 资产负债表={hit_balance}")
+        return hit_income and hit_balance
+    except Exception as e:
+        log.debug(f"  关键词判断失败: {e}")
+        return False
 
 
 # ─── CIK / submissions ────────────────────────────────────────────────────────
@@ -358,21 +364,43 @@ def find_latest_filing_from_submissions(submissions: dict,
 
 
 # ─── 核心：从 master.idx 找财务 6-K ──────────────────────────────────────────
-def find_financial_6k(cik: str) -> Optional[dict]:
+def find_financial_6k(ticker: str, cik: str) -> Optional[dict]:
+    """
+    从 master.idx 找财务 6-K：
+      按日期从新到旧逐一下载 .txt，
+      读取前 300KB 用关键词判断是否含财务报表，
+      命中则保留，否则删除继续找下一条。
+    返回 filing 信息，含 save_path（已下载完成的文件路径）。
+    """
     candidates = parse_6k_from_master(cik)[:MAX_6K_SCAN]
-    log.debug(f"[CIK {cik}] master.idx 共找到 {len(candidates)} 条 6-K")
+    log.debug(f"[{ticker}] master.idx 共找到 {len(candidates)} 条 6-K")
 
     for f in candidates:
-        size = get_file_size(f["txt_url"])
-        size_kb = f"{size//1024}KB" if size else "?"
-        log.debug(f"  {f['filingDate']}  {size_kb:>8s}  {f['txt_url']}")
-        if size and size >= MIN_6K_BYTES:
-            log.info(f"[CIK {cik}] 财务 6-K: {f['filingDate']} ({size//1024}KB)")
-            f["primaryDocument"] = Path(f["filepath"]).name
+        filename  = f"{ticker}_6-K_{f['filingDate']}.txt"
+        save_path = Path(OUTPUT_DIR) / ticker / filename
+
+        # 已存在则直接视为命中（之前已验证过）
+        if save_path.exists():
+            log.debug(f"[{ticker}] 6-K 已存在: {save_path}")
+            f["save_path"] = save_path
             f["form"] = "6-K"
             return f
 
-    log.debug(f"[CIK {cik}] 未找到 >={MIN_6K_BYTES//1024}KB 的 6-K")
+        log.debug(f"[{ticker}] 下载 6-K {f['filingDate']}: {f['txt_url']}")
+        ok = download_file(f["txt_url"], save_path)
+        if not ok:
+            continue
+
+        if is_financial_6k(save_path):
+            log.info(f"[{ticker}] 财务 6-K: {f['filingDate']} ({save_path.stat().st_size//1024}KB)")
+            f["save_path"] = save_path
+            f["form"] = "6-K"
+            return f
+        else:
+            log.debug(f"[{ticker}] 非财务 6-K，删除，继续")
+            save_path.unlink(missing_ok=True)
+
+    log.debug(f"[{ticker}] 未找到财务 6-K")
     return None
 
 
@@ -503,7 +531,7 @@ def process_ticker(ticker: str) -> dict:
         save_progress(ticker, result)
         return result
     else:
-        filing_6k  = find_financial_6k(cik)
+        filing_6k  = find_financial_6k(ticker, cik)
         filing_20f = find_latest_filing_from_submissions(subs, ["20-F"])
 
         if not filing_6k and not filing_20f:
@@ -515,17 +543,23 @@ def process_ticker(ticker: str) -> dict:
         if filing_6k and filing_20f:
             if filing_6k["filingDate"] >= filing_20f["filingDate"]:
                 log.info(f"[{ticker}] 6-K({filing_6k['filingDate']}) >= "
-                         f"20-F({filing_20f['filingDate']}), 下载 6-K")
-                result = _download_filing(ticker, cik, filing_6k, result, "6-K")
+                         f"20-F({filing_20f['filingDate']}), 使用 6-K")
+                result.update(status="ok", form="6-K",
+                              file=str(filing_6k["save_path"]),
+                              date=filing_6k["filingDate"])
             else:
                 log.info(f"[{ticker}] 20-F({filing_20f['filingDate']}) > "
                          f"6-K({filing_6k['filingDate']}), 下载 20-F")
+                # 6-K 已下载但不用，删掉
+                filing_6k["save_path"].unlink(missing_ok=True)
                 result = _download_filing(ticker, cik, filing_20f, result)
             save_progress(ticker, result)
             return result
 
         if filing_6k:
-            result = _download_filing(ticker, cik, filing_6k, result, "6-K")
+            result.update(status="ok", form="6-K",
+                          file=str(filing_6k["save_path"]),
+                          date=filing_6k["filingDate"])
         else:
             result = _download_filing(ticker, cik, filing_20f, result)
         save_progress(ticker, result)

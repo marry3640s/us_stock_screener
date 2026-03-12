@@ -1,0 +1,128 @@
+{
+  "TTD": {
+    "status": "ok",
+    "form": "10-K",
+    "file": "sec-data/TTD/TTD_10-K_2026-02-27.htm",
+    "date": "2026-02-27",
+    "reason": ""
+  },
+  "AAPL": {
+    "status": "ok",
+    "form": "10-Q",
+    "file": "sec-data/AAPL/AAPL_10-Q_2026-01-30.htm",
+    "date": "2026-01-30",
+    "reason": ""
+  },
+  "DUOL": {
+    "status": "ok",
+    "form": "10-K",
+    "file": "sec-data/DUOL/DUOL_10-K_2026-02-27.htm",
+    "date": "2026-02-27",
+    "reason": ""
+  },
+  "UPWK": {
+    "status": "ok",
+    "form": "10-K",
+    "file": "sec-data/UPWK/UPWK_10-K_2026-02-13.htm",
+    "date": "2026-02-13",
+    "reason": ""
+  },
+  "FVRR": {
+    "status": "ok",
+    "form": "6-K",
+    "file": "sec-data/FVRR/FVRR_6-K_2026-02-18.txt",
+    "date": "2026-02-18",
+    "reason": ""
+  },
+  "FIVN": {
+    "status": "ok",
+    "form": "10-K",
+    "file": "sec-data/FIVN/FIVN_10-K_2026-02-20.htm",
+    "date": "2026-02-20",
+    "reason": ""
+  },
+  "GDRX": {
+    "status": "ok",
+    "form": "10-K",
+    "file": "sec-data/GDRX/GDRX_10-K_2026-02-26.htm",
+    "date": "2026-02-26",
+    "reason": ""
+  },
+  "SNAP": {
+    "status": "ok",
+    "form": "10-K",
+    "file": "sec-data/SNAP/SNAP_10-K_2026-02-05.htm",
+    "date": "2026-02-05",
+    "reason": ""
+  },
+  "QFIN": {
+    "status": "ok",
+    "form": "6-K",
+    "file": "sec-data/QFIN/QFIN_6-K_2025-11-19.txt",
+    "date": "2025-11-19",
+    "reason": ""
+  },
+  "GTLB": {
+    "status": "ok",
+    "form": "10-Q",
+    "file": "sec-data/GTLB/GTLB_10-Q_2025-12-03.htm",
+    "date": "2025-12-03",
+    "reason": ""
+  },
+  "FIG": {
+    "status": "ok",
+    "form": "10-K",
+    "file": "sec-data/FIG/FIG_10-K_2026-02-18.htm",
+    "date": "2026-02-18",
+    "reason": ""
+  },
+  "FUBO": {
+    "status": "ok",
+    "form": "10-Q",
+    "file": "sec-data/FUBO/FUBO_10-Q_2026-02-05.htm",
+    "date": "2026-02-05",
+    "reason": ""
+  },
+  "IH": {
+    "status": "ok",
+    "form": "6-K",
+    "file": "sec-data/IH/IH_6-K_2025-12-29.txt",
+    "date": "2025-12-29",
+    "reason": ""
+  },
+  "PDD": {
+    "status": "ok",
+    "form": "6-K",
+    "file": "sec-data/PDD/PDD_6-K_2025-11-18.txt",
+    "date": "2025-11-18",
+    "reason": ""
+  },
+  "JD": {
+    "status": "ok",
+    "form": "6-K",
+    "file": "sec-data/JD/JD_6-K_2025-12-11.txt",
+    "date": "2025-12-11",
+    "reason": ""
+  },
+  "ADBE": {
+    "status": "ok",
+    "form": "10-K",
+    "file": "sec-data/ADBE/ADBE_10-K_2026-01-15.htm",
+    "date": "2026-01-15",
+    "reason": ""
+  },
+  "STNE": {
+    "status": "ok",
+    "form": "6-K",
+    "file": "sec-data/STNE/STNE_6-K_2026-03-02.txt",
+    "date": "2026-03-02",
+    "reason": ""
+  },
+  "PAGS": {
+    "status": "ok",
+    "form": "6-K",
+    "file": "sec-data/PAGS/PAGS_6-K_2025-11-12.txt",
+    "date": "2025-11-12",
+    "reason": ""
+  }
+}
