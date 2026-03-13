@@ -168,23 +168,68 @@ def detect_currency(text):
     # Only check headers (first 5000 chars) for primary currency
     header = text[:5000].upper()
     for pat, cur in [(r"\bRMB\b|RENMINBI","RMB"),(r"REAIS|\bBRL\b|R\$","BRL"),
-                     (r"\bHKD\b|HK\$","HKD"),(r"\bEUR(?:O|OS)?\b","EUR"),
-                     (r"\bGBP\b|POUND\s*STERLING","GBP"),(r"\bJPY\b","JPY"),
-                     (r"\bNTD\b|\bTWD\b|NEW\s+TAIWAN\s+DOLLAR","NTD")]:
+                     (r"\bHKD\b|HK\$","HKD"),
+                     # EUR: require reporting-currency context; XBRL iso4217:EUR declarations in US filings
+                     # should not be counted (many US companies have EUR-denominated subsidiaries/debt).
+                     (r"IN\s+(?:THOUSANDS|MILLIONS|BILLIONS)\s+OF\s+EUROS?"
+                      r"|(?:EXPRESSED|DENOMINATED|PRESENTED|REPORTED|STATED)\s+IN\s+EUROS?"
+                      r"|FUNCTIONAL\s+CURRENCY\s+IS\s+THE\s+EURO", "EUR"),
+                     (r"POUND\s*STERLING|\bGBP\b\s+(?:THOUSANDS|MILLIONS|BILLIONS)","GBP"),(r"\bJPY\b","JPY"),
+                     # NTD/TWD: require reporting-currency context; bare NTD/TWD in US filings
+                     # often refers to Taiwan subsidiaries, not the primary reporting currency.
+                     (r"IN\s+(?:THOUSANDS|MILLIONS|BILLIONS)\s+OF\s+(?:NEW\s+TAIWAN\s+)?DOLLARS?\s+\(?NTD\)?"
+                      r"|(?:EXPRESSED|DENOMINATED|PRESENTED|REPORTED|STATED)\s+IN\s+(?:NTD\b|TWD\b|NEW\s+TAIWAN\s+DOLLARS?)"
+                      r"|FUNCTIONAL\s+CURRENCY\s+IS\s+THE\s+(?:NTD|TWD|NEW\s+TAIWAN\s+DOLLAR)"
+                      r"|iso4217:TWD", "NTD"),
+                     (r"\bINR\b|INDIAN\s+RUPEE|&#8377;|₹","INR")]:
         if re.search(pat, header): return cur
     # Broader check with strict patterns (avoid "yen" in body text)
     t = text[:50000].upper()
+    # 若明确声明以美元报告，提前返回 USD（防止后续扩展搜索误匹配）
+    if re.search(r"(?:U\.S\.|UNITED\s+STATES)\s+DOLLARS?\s+IN\s+(?:THOUSANDS|MILLIONS|BILLIONS)"
+                 r"|IN\s+(?:THOUSANDS|MILLIONS|BILLIONS)\s+OF\s+(?:U\.S\.|UNITED\s+STATES)\s+DOLLARS?"
+                 r"|(?:EXPRESSED|DENOMINATED|PRESENTED|REPORTED|STATED)\s+IN\s+(?:U\.S\.|UNITED\s+STATES)\s+DOLLARS?"
+                 r"|FUNCTIONAL\s+CURRENCY\s+IS\s+THE\s+(?:U\.S\.|UNITED\s+STATES)\s+DOLLAR", t):
+        return "USD"
     for pat, cur in [(r"\bRMB\b|RENMINBI","RMB"),(r"REAIS|\bBRL\b","BRL"),
-                     (r"\bHKD\b|HK\$","HKD"),(r"\bGBP\b","GBP"),
+                     (r"\bHKD\b|HK\$","HKD"),
+                     # GBP：要求在报告货币上下文中出现，排除括号折算值如 "(GBP 1.8 million)"
+                     (r"POUND\s*STERLING"
+                      r"|IN\s+(?:THOUSANDS|MILLIONS|BILLIONS)\s+OF\s+(?:BRITISH\s+)?POUNDS?"
+                      r"|(?:EXPRESSED|DENOMINATED|PRESENTED|REPORTED|STATED)\s+IN\s+(?:GBP\b|BRITISH\s+POUNDS?|POUNDS?\s+STERLING)"
+                      r"|FUNCTIONAL\s+CURRENCY\s+IS\s+THE\s+(?:GBP|BRITISH\s+POUND|POUND\s+STERLING)", "GBP"),
                      (r"DENOMINATED\s+IN.*?(?:YEN|JPY)|\bJPY\b","JPY"),
-                     (r"\bNTD\b|\bTWD\b|NEW\s+TAIWAN\s+DOLLAR","NTD")]:
+                     (r"IN\s+(?:THOUSANDS|MILLIONS|BILLIONS)\s+OF\s+(?:NEW\s+TAIWAN\s+)?DOLLARS?\s+\(?NTD\)?"
+                      r"|(?:EXPRESSED|DENOMINATED|PRESENTED|REPORTED|STATED)\s+IN\s+(?:NTD\b|TWD\b|NEW\s+TAIWAN\s+DOLLARS?)"
+                      r"|FUNCTIONAL\s+CURRENCY\s+IS\s+THE\s+(?:NTD|TWD|NEW\s+TAIWAN\s+DOLLAR)"
+                      r"|iso4217:TWD", "NTD"),
+                     # INR: Indian Rupee — match explicit declarations, exclude FX rate mentions like "USD/INR at 84"
+                     (r"INDIAN\s+RUPEE|&#8377;|₹"
+                      r"|IN\s+(?:THOUSANDS|MILLIONS|BILLIONS)\s+OF\s+(?:INDIAN\s+)?RUPEES?"
+                      r"|(?:EXPRESSED|DENOMINATED|PRESENTED|REPORTED|STATED)\s+IN\s+(?:INR\b|INDIAN\s+RUPEES?)"
+                      r"|FUNCTIONAL\s+CURRENCY\s+IS\s+THE\s+(?:INR|INDIAN\s+RUPEE)"
+                      r"|iso4217:INR", "INR")]:
         if re.search(pat, t): return cur
     # Extended check (up to 1MB) for filings where currency is declared deep in the document
     t2 = text[:1000000].upper()
-    for pat, cur in [(r"\bCAD\b|CANADIAN\s+DOLLAR","CAD"),
-                     (r"iso4217:CAD","CAD"),
-                     (r"\bNTD\b|\bTWD\b|NEW\s+TAIWAN\s+DOLLAR","NTD"),
-                     (r"\bRMB\b|RENMINBI","RMB"),(r"\bHKD\b|HK\$","HKD")]:
+    for pat, cur in [
+        # CAD: 仅匹配明确的报告货币声明，排除外汇风险列表中的提及
+        (r"iso4217:CAD"
+         r"|(?:EXPRESSED|DENOMINATED|REPORTED|STATED|PRESENTED)\s+IN\s+(?:CANADIAN\s+DOLLARS?|CAD\b)"
+         r"|(?:IN\s+MILLIONS|IN\s+THOUSANDS)\s+OF\s+CANADIAN\s+DOLLARS?"
+         r"|AMOUNTS?\s+(?:ARE\s+)?IN\s+(?:CANADIAN\s+DOLLARS?|CAD\b)"
+         r"|FUNCTIONAL\s+CURRENCY\s+IS\s+THE\s+CANADIAN\s+DOLLAR", "CAD"),
+        (r"IN\s+(?:THOUSANDS|MILLIONS|BILLIONS)\s+OF\s+(?:NEW\s+TAIWAN\s+)?DOLLARS?\s+\(?NTD\)?"
+         r"|(?:EXPRESSED|DENOMINATED|PRESENTED|REPORTED|STATED)\s+IN\s+(?:NTD\b|TWD\b|NEW\s+TAIWAN\s+DOLLARS?)"
+         r"|FUNCTIONAL\s+CURRENCY\s+IS\s+THE\s+(?:NTD|TWD|NEW\s+TAIWAN\s+DOLLAR)"
+         r"|iso4217:TWD", "NTD"),
+        # RMB: in 1MB scan require reporting-currency context to avoid false positives
+        # from FX-risk disclosures listing "Chinese Renminbi" alongside many other currencies.
+        (r"IN\s+(?:THOUSANDS|MILLIONS|BILLIONS)\s+OF\s+(?:CHINESE\s+)?(?:YUAN|RMB|RENMINBI)"
+         r"|(?:EXPRESSED|DENOMINATED|PRESENTED|REPORTED|STATED)\s+IN\s+(?:RMB\b|RENMINBI|YUAN)"
+         r"|FUNCTIONAL\s+CURRENCY\s+IS\s+(?:THE\s+)?(?:RMB|RENMINBI|CHINESE\s+YUAN)"
+         r"|iso4217:CNY", "RMB"),
+        (r"\bHKD\b|HK\$","HKD")]:
         if re.search(pat, t2): return cur
     return "USD"
 
@@ -231,18 +276,125 @@ def detect_table_unit(table, raw_html):
         ht += " " + tr.get_text(separator=" ", strip=True)
     hu = ht.upper()
     if re.search(r"IN\s+THOUSANDS", hu): return "thousands", 0.001
-    if re.search(r"IN\s+MILLIONS", hu): return "millions", 1.0
-    if re.search(r"IN\s+BILLIONS", hu): return "billions", 1000.0
+    if re.search(r"IN\s+(?:\w+\s+)?MILLIONS?(?:\b|$|[^A-Z])", hu): return "millions", 1.0
+    if re.search(r"IN\s+(?:\w+\s+)?BILLIONS?(?:\b|$|[^A-Z])", hu): return "billions", 1000.0
+    # "IN USD" / "IN U.S. DOLLARS" / "IN US DOLLARS" without scale qualifier = individual dollars
+    if re.search(r"\bIN\s+(?:USD|U\.S\.\s+DOLLARS?|US\s+DOLLARS?)\b", hu):
+        return "ones", 1e-6
+    # "$'000" / "US$'000" / "HK$'000" notation = thousands (common in HK/AU/SG filings)
+    # Note: the apostrophe may be a Unicode curly quote (U+2019 ') not straight apostrophe
+    if re.search(r"(?:US\$|HK\$|AU\$|NZ\$|\$|USD|RMB|CNY|SGD)\s*[\u2019\u2018'\u0060]?\s*000\b", ht):
+        return "thousands(notation)", 0.001
+    # Method 2b: XBRL inline decimals/scale attributes — checked BEFORE nearby-HTML scan.
+    # ix:nonFraction decimals="-3" → thousands; "-6" → millions; "0" → ones.
+    # When scale attribute is present (iXBRL): display_unit = 10^scale (scale=6 → millions,
+    # scale=3 → thousands, etc.). Scale overrides decimals for determining displayed unit.
     try:
-        anchor = str(table)[:80]
-        pos = raw_html.find(anchor[:60])
+        dec_vals = []
+        scale_vals = []
+        import math
+        for elem in table.find_all(True, attrs={"decimals": True}):
+            try:
+                v = float(elem["decimals"])
+                if not math.isinf(v): dec_vals.append(int(v))
+            except: pass
+            try:
+                sc = elem.get("scale")
+                if sc is not None:
+                    sv = int(sc)
+                    scale_vals.append(sv)
+            except: pass
+        if dec_vals or scale_vals:
+            from collections import Counter
+            if scale_vals:
+                # scale attribute determines the display unit: displayed = raw × 10^scale
+                most_common_scale = Counter(scale_vals).most_common(1)[0][0]
+                if most_common_scale == 6: return "millions(xbrl)", 1.0
+                if most_common_scale == 3: return "thousands(xbrl)", 0.001
+                if most_common_scale == 0: return "ones(xbrl)", 1e-6
+                if most_common_scale == 9: return "billions(xbrl)", 1000.0
+            if dec_vals:
+                most_common = Counter(dec_vals).most_common(1)[0][0]
+                if most_common == -3: return "thousands(xbrl)", 0.001
+                if most_common == -6: return "millions(xbrl)", 1.0
+                if most_common == 0:  return "ones(xbrl)", 1e-6
+                if most_common == -9: return "billions(xbrl)", 1000.0
+    except Exception: pass
+    # Method 4 (early): Currency-symbol column headers + large integer values → ones
+    # Run BEFORE nearby/DOM scan to prevent false "thousands" from DOM overriding clear "ones" evidence.
+    # (e.g., GMHS: "$" data cells with values like 15,328,252 → individual dollars)
+    # Guard: only fires when standalone $ is present AND numeric values look like individual dollars
+    # (i.e., at least one value >= 1,000,000 — distinguishes $15M individual from $8,492.6 millions)
+    try:
+        _hdr_cells_early = []
+        for tr in table.find_all("tr")[:6]:
+            for td in tr.find_all(["td", "th"]):
+                cell = td.get_text(" ", strip=True).strip().upper()
+                if cell: _hdr_cells_early.append(cell)
+        _hdr_txt_early = " ".join(_hdr_cells_early)
+        if not re.search(r"THOUSANDS|MILLIONS|BILLIONS", _hdr_txt_early):
+            _has_dollar = (any(c in ("US$", "$", "HK$", "C$") for c in _hdr_cells_early) or
+                           any(t in ("US$", "$", "HK$", "C$")
+                               for cell in _hdr_cells_early for t in cell.split()))
+            if _has_dollar:
+                # Check if any numeric value in first 10 rows is >= 1,000,000 (individual dollars)
+                _has_large_val = False
+                for _tr in table.find_all("tr")[:10]:
+                    _row_txt = _tr.get_text(" ", strip=True)
+                    for _m in re.finditer(r'\b(\d[\d,]+)\b', _row_txt):
+                        try:
+                            _v = float(_m.group(1).replace(",", ""))
+                            if _v >= 1_000_000:
+                                _has_large_val = True; break
+                        except: pass
+                    if _has_large_val: break
+                if _has_large_val:
+                    return "ones", 1e-6
+    except Exception: pass
+    # Method 2: Search raw_html before the table for unit qualifiers.
+    # Anchor strategy: use the first single text node that looks like a financial label
+    # (not a date/year cell), normalized for non-breaking spaces and case.
+    try:
+        tbl_texts = [t.strip().replace('\xa0', ' ').replace('\u2009', ' ')
+                     for t in table.stripped_strings if t.strip()]
+        # Pick first text that is a financial label (not a date string or purely numeric)
+        # Exclude generic temporal headers that appear in many tables (e.g. "Year Ended December 31,")
+        # to avoid matching the wrong table in the raw HTML when the same header repeats.
+        anchor_text = ''
+        for tok in tbl_texts:
+            if (len(tok) >= 8 and re.search(r'[A-Za-z]{3}', tok)
+                    and not re.match(r'^[\d\s,./]+$', tok)
+                    and not re.match(r'^(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', tok, re.I)
+                    and not re.match(r'^(?:first|second|third|fourth|q[1-4])\s', tok, re.I)
+                    and not re.match(r'^year\s+ended', tok, re.I)
+                    and not re.match(r'^(?:three|six|nine|twelve)\s+months', tok, re.I)
+                    and not re.match(r'^for\s+the\s+(?:three|six|nine|twelve|year)', tok, re.I)
+                    and not re.match(r'^as\s+of\b', tok, re.I)):
+                anchor_text = tok[:50]
+                break
+        pos = -1
+        if anchor_text:
+            pos = raw_html.find(anchor_text)
+            if pos < 0:
+                pos = raw_html.upper().find(anchor_text.upper())
+        if pos < 0:
+            # Fallback: str(table) anchor (works for lxml-normalized htm files)
+            anchor = str(table)[:80]
+            pos = raw_html.find(anchor[:60])
         if pos > 0:
-            before = re.sub(r"<[^>]+>", " ", raw_html[max(0, pos-3000):pos]).upper()
+            before = re.sub(r"<[^>]+>", " ", raw_html[max(0, pos-20000):pos]).upper()
             tp = mp = -1
             for m in re.finditer(r"IN\s+THOUSANDS", before): tp = m.start()
             for m in re.finditer(r"IN\s+MILLIONS", before): mp = m.start()
             if tp > mp >= 0 or (tp >= 0 and mp < 0): return "thousands(nearby)", 0.001
             if mp > tp >= 0 or (mp >= 0 and tp < 0): return "millions(nearby)", 1.0
+            # Also search after the anchor (some filings put unit note after the table header)
+            after = re.sub(r"<[^>]+>", " ", raw_html[pos:min(len(raw_html), pos+5000)]).upper()
+            tp2 = mp2 = -1
+            for m in re.finditer(r"IN\s+THOUSANDS", after): tp2 = m.start()
+            for m in re.finditer(r"IN\s+MILLIONS", after): mp2 = m.start()
+            if tp2 >= 0 and (mp2 < 0 or tp2 < mp2): return "thousands(nearby-after)", 0.001
+            if mp2 >= 0 and (tp2 < 0 or mp2 < tp2): return "millions(nearby-after)", 1.0
     except Exception: pass
     # Method 3: Check preceding sibling/parent elements in DOM
     # Only use if the found text is a close ancestor/sibling of the table (within 4 levels)
@@ -262,8 +414,8 @@ def detect_table_unit(table, raw_html):
                 if "IN THOUSANDS" in ptxt: return "thousands(dom)", 0.001
                 if "IN BILLIONS" in ptxt: return "billions(dom)", 1000.0
     except Exception: pass
-    # Method 4: Currency-symbol-only column headers without unit qualifier
-    # (e.g., YALA reports in full USD with "US$" column headers, no "in thousands"/"in millions")
+    # Method 4: Currency-symbol column headers without unit qualifier
+    # (e.g., YALA: "US$" standalone cells; NFGC: "$" embedded in "Sep 30, 2025 $" cells)
     try:
         header_cells = []
         for tr in table.find_all("tr")[:6]:
@@ -272,8 +424,37 @@ def detect_table_unit(table, raw_html):
                 if cell: header_cells.append(cell)
         hdr_txt = " ".join(header_cells)
         if not re.search(r"THOUSANDS|MILLIONS|BILLIONS", hdr_txt):
-            if any(c in ("US$", "$", "HK$") for c in header_cells):
-                return "ones", 1e-6
+            _has_currency = (
+                any(c in ("US$", "$", "HK$", "C$") for c in header_cells) or
+                any(t in ("US$", "$", "HK$", "C$")
+                    for cell in header_cells for t in cell.split())
+            )
+            if _has_currency:
+                # Magnitude check: ones tables have raw values >= 1,000,000 (e.g. $950M = 950,000,000).
+                # Millions tables show the same amount as "950.0", max < 1,000,000.
+                # Without this check, tables reporting in $M with standalone "$" cells (AMG, APD, JHX)
+                # are incorrectly classified as ones, giving results 1,000,000x too small.
+                _has_large_val_m4 = False
+                for _tr_m4 in table.find_all("tr")[:10]:
+                    for _m_m4 in re.finditer(r'\b(\d[\d,]+)\b', _tr_m4.get_text(" ", strip=True)):
+                        try:
+                            if float(_m_m4.group(1).replace(",", "")) >= 1_000_000:
+                                _has_large_val_m4 = True; break
+                        except: pass
+                    if _has_large_val_m4: break
+                if _has_large_val_m4:
+                    return "ones", 1e-6
+    except Exception: pass
+    # Method 2c: Full-document fallback — scan entire doc for unit declarations
+    # Last resort when table header and nearby HTML have no explicit unit marker.
+    # Only fires when all other methods have returned nothing.
+    try:
+        full_text = re.sub(r"<[^>]+>", " ", raw_html).upper()
+        tp = mp = -1
+        for m in re.finditer(r"IN\s+THOUSANDS", full_text): tp = m.start()
+        for m in re.finditer(r"IN\s+MILLIONS", full_text): mp = m.start()
+        if tp > mp >= 0 or (tp >= 0 and mp < 0): return "thousands(doc)", 0.001
+        if mp > tp >= 0 or (mp >= 0 and tp < 0): return "millions(doc)", 1.0
     except Exception: pass
     return "unknown", 0
 
@@ -362,7 +543,7 @@ def build_row_label(cells):
     label = re.sub(r"\s+\d{1,2}$", "", label)
     return label
 
-def find_row_value(rows, patterns, col_index=0):
+def find_row_value(rows, patterns, col_index=0, negate_loss=False):
     for pat in patterns:
         for row in rows:
             if not row: continue
@@ -370,70 +551,95 @@ def find_row_value(rows, patterns, col_index=0):
             try:
                 if re.search(pat, label, re.I):
                     nums = extract_numbers_from_row(row)
-                    if nums and col_index < len(nums): return nums[col_index]
+                    if nums and col_index < len(nums):
+                        val = nums[col_index]
+                        if negate_loss and val is not None and val > 0:
+                            # Pure "loss" label (no "income"/"profit"/"earnings" alongside)
+                            # e.g. "Operating loss", "Net loss", "Loss from operations"
+                            ll = label.lower()
+                            if re.search(r'\bloss\b', ll) and not re.search(r'\b(?:income|profit|earning)\b', ll):
+                                val = -val
+                        return val
             except re.error: continue
     return None
 
+# Fields whose matched-label "loss" rows should yield negative values
+_NEGATE_LOSS_FIELDS = {"operating_income", "net_income", "pretax_income", "gross_profit"}
+
 def extract_from_table(rows, patterns, col=0):
-    return {k: find_row_value(rows, pats, col_index=col) for k, pats in patterns.items()}
+    return {k: find_row_value(rows, pats, col_index=col,
+                              negate_loss=(k in _NEGATE_LOSS_FIELDS))
+            for k, pats in patterns.items()}
 
 def detect_latest_column(rows):
     """
     检测表格中最新数据所在的列索引。
-    扫描前 5 行的年份数字，找到最大年份对应的第一个数据列。
-    对于 '2024 | 2025 | US$' 排列，返回 1（第二个数字列）。
-    对于 '2025 | 2024 | 2023' 排列，返回 0（第一个数字列）。
-    对于 BS 的 'Dec 31, 2024 | Sep 30, 2025' 排列，返回 1。
+    使用年份+月份作为排序键，找到最新日期对应的第一个数据列。
+    例：'2023 | 2024 | 2025' → col 2；'2025 | 2024 | 2023' → col 0；
+    'Sep-2024 | Jun-2025 | Sep-2025' → col 2（月份感知，避免选到 Jun-2025）。
+    跨行关联：年份和月份可分布在不同的行（如 NTES：第1行含月份，第2行含年份）。
     """
-    # Collect year mentions from header rows
-    year_positions = []  # [(year, col_position)]
-    for row in rows[:6]:
-        col_pos = 0
-        for cell in row:
-            cell_text = cell.strip()
-            if not cell_text:
+    _MONTH_MAP = {
+        'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6,
+        'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12,
+        'january':1,'february':2,'march':3,'april':4,'june':6,'july':7,
+        'august':8,'september':9,'october':10,'november':11,'december':12,
+    }
+    header_rows = rows[:6]
+    # Pass 1: build per-table-column-index maps for year and month (cross-row)
+    # table_col_year[k] = first year found in column k across all header rows
+    # table_col_month[k] = month found in column k across all header rows
+    table_col_year = {}
+    table_col_month = {}
+    for row in header_rows:
+        for k, cell in enumerate(row):
+            ct = cell.strip()
+            if not ct:
                 continue
-            # Look for 4-digit years
-            years_in_cell = re.findall(r'20[12][0-9]', cell_text)
+            years = re.findall(r'20[12][0-9]', ct)
+            if years and k not in table_col_year:
+                table_col_year[k] = int(years[0])
+            cl = ct.lower()
+            if k not in table_col_month:
+                for mname, mnum in _MONTH_MAP.items():
+                    if mname in cl:
+                        table_col_month[k] = mnum
+                        break
+    # Pass 2: build date_positions list using cross-row month lookup when month=0
+    date_positions = []  # [(sortkey, col_pos)]
+    for row in header_rows:
+        col_pos = 0
+        for k, cell in enumerate(row):
+            ct = cell.strip()
+            if not ct:
+                continue
+            years_in_cell = re.findall(r'20[12][0-9]', ct)
             for y in years_in_cell:
-                year_positions.append((int(y), col_pos))
-            # Track position of numeric data columns
-            v = parse_num(cell_text)
+                # First try month from this cell; fall back to same column in other rows
+                month = 0
+                cl = ct.lower()
+                for mname, mnum in _MONTH_MAP.items():
+                    if mname in cl:
+                        month = mnum
+                        break
+                if month == 0:
+                    month = table_col_month.get(k, 0)
+                date_positions.append((int(y) * 100 + month, col_pos))
+            v = parse_num(ct)
             if v is not None and abs(v) > 50:
                 col_pos += 1
 
-    if not year_positions:
+    if not date_positions:
         return 0
 
-    max_year = max(yp[0] for yp in year_positions)
-    min_year = min(yp[0] for yp in year_positions)
+    max_key = max(dp[0] for dp in date_positions)
+    if max_key == min(dp[0] for dp in date_positions):
+        return 0  # only one date found, use first column
 
-    if max_year == min_year:
-        return 0  # only one year, use first column
-
-    # Find which data column corresponds to the latest year
-    # In PDD style: header row has [2024, 2025, 2024, 2025]
-    # where positions are [0, 1, 2, 3] -> Q3 2024, Q3 2025, 9M 2024, 9M 2025
-    # We want col_index=1 (first occurrence of max_year in data columns)
-
-    # Simpler heuristic: check if first year in sequence is older
-    header_years = []
-    for row in rows[:4]:
-        for cell in row:
-            cell_text = cell.strip()
-            years = re.findall(r'20[12][0-9]', cell_text)
-            for y in years:
-                if int(y) not in header_years or len(header_years) < 6:
-                    header_years.append(int(y))
-
-    if len(header_years) >= 2:
-        # If first year < second year -> col 0 is old, col 1 is new
-        if header_years[0] < header_years[1]:
-            return 1
-        # If first year > second year -> col 0 is newest (e.g., 10-K: 2025, 2024, 2023)
-        elif header_years[0] > header_years[1]:
-            return 0
-    
+    # Return col_pos of the FIRST occurrence of the max date key
+    for key, cp in date_positions:
+        if key == max_key:
+            return cp
     return 0
 
 def extract_eps_contextual(rows, col=0):
@@ -481,7 +687,11 @@ def extract_shares_contextual(rows, col=0, table_text=""):
     sh_b = sh_d = None
     in_shares = False
     already_ads = False
-    in_thousands = "thousand" in table_text.lower()
+    _tl = table_text.lower()
+    in_thousands = "thousand" in _tl
+    # 若表头注明 "except (for) share/per-share data"，股数是原始计数而非 thousands
+    if in_thousands and re.search(r"except\s+(?:for\s+)?(?:share|per[\s\-]share)", _tl):
+        in_thousands = False
     for row in rows:
         first_cell = ''
         for c in row:
@@ -495,7 +705,8 @@ def extract_shares_contextual(rows, col=0, table_text=""):
             if re.search(r'\bads[s]?\b', fl):
                 already_ads = True
             continue
-        if in_shares and not re.match(r'^[-—–]{0,2}\s*(?:basic|diluted)', fl):
+        if in_shares and fl and not re.match(r'^[-—–]{0,2}\s*(?:basic|diluted)', fl):
+            # blank rows (fl='') are spacer rows — do NOT reset in_shares
             in_shares = False
             continue
         if in_shares and re.match(r'^[-—–]{0,2}\s*basic\s+and\s+diluted', fl):
@@ -523,10 +734,12 @@ IS_PATTERNS = {
     "revenue": [r"^total\s+revenue(?:\s+and\s+income)?$", r"^total\s+(?:net\s+)?revenues?$",
                 r"^(?:total\s+)?(?:net\s+)?revenues?$", r"^(?:total\s+)?net\s+sales$",
                 r"^revenues?$",
-                r"^total\s+operating\s+revenue$",          # LX
+                r"^total\s+operating\s+revenues?$",         # LX, ATO
                 r"^total\s+net\s+revenue$",                # QFIN
                 r"^total\s+revenue\s+and\s+income\b",      # STNE
                 r"^total\s+revenues?\s*\(excluding\b",     # JFU
+                r"^sales$",                                # MRK: bare "Sales" label
+                r"^total\s+sales$",
 ],
     "cost_of_revenue": [r"^(?:total\s+)?costs?\s+of\s+(?:revenues?|goods\s+sold|sales|services)",
                         r"^total\s+cost\s+of\s+revenue",
@@ -547,9 +760,9 @@ IS_PATTERNS = {
                          r"^[\(/]?\s*(?:loss|income|profit)[\)/]?(?:[/\s]+(?:income|loss|profit))?\s*from\s+operations",  # TAL
                          r"^pre.provision,?\s*pre.tax\s*earnings",    # RY/banks: Pre-provision, pre-tax earnings
 ],
-    "net_income": [r"^net\s+(?:income|loss|earnings?|profit)(?:\s+and\s+comprehensive)?(?:\s+(?:income|loss))?$",
+    "net_income": [r"^net\s+(?:income|loss|earnings?|profit)(?:\s+and\s+comprehensive)?(?:\s+\(?(?:income|loss)\)?)?\s*$",
                    r"^net\s+(?:income|loss)\s+attributable\s+to",
-                   r"^(?:profit|loss)\s+for\s+the\s+(?:year|period|quarter)",
+                   r"^(?:profit|loss)\s+for\s+the\s+(?:\w+\s+)?(?:year|period|quarter)",
                    r"^net\s+(?:income|loss|earnings?|profit)",
                    r"^net\s+(?:income|loss)\s+for\s+the\s+(?:period|quarter|year)",
                    r"^(?:profit|loss)\s+attributable\s+to",
@@ -591,17 +804,27 @@ SHARES_PATTERNS = {
                      r"denominator.*?basic",
                      r"(?:basic|ordinary)\s+(?:weighted|shares)",
                      r"shares\s+used\s+to\s+compute\s+basic",
-                     r"weighted\s+average\s+number\s+of\s+(?:outstanding\s+)?(?:common\s+)?shares"],
+                     r"weighted\s+average\s+number\s+of\s+(?:outstanding\s+)?(?:common\s+)?shares",
+                     # "Basic average shares outstanding" format (e.g. NUE) — no "weighted" keyword
+                     r"basic\s+average\s+shares",
+                     r"average\s+(?:common\s+)?shares?\s+outstanding.*?basic"],
     "shares_diluted": [r"denominator.*?dilut(?:ive|ed).*?(?:weighted|share)",
                        r"weighted[\s-]*average.*?dilut",
                        r"diluted\s+(?:weighted|shares)",
-                       r"shares\s+used\s+to\s+compute\s+diluted"],
+                       r"shares\s+used\s+to\s+compute\s+diluted",
+                       # "Diluted average shares outstanding" format (e.g. NUE)
+                       r"diluted\s+average\s+shares",
+                       r"average\s+(?:common\s+)?shares?\s+outstanding.*?diluted"],
 }
 BS_PATTERNS = {
-    "total_assets": [r"^total\s+assets$", r"^total$"],
+    "total_assets": [r"^total\s+assets$", r"^total$",
+                     r"^total\s+assets\s+and\s+liabilities$",
+                     r"^total\s+liabilities\s+and\s+(?:shareholders?|stockholders?|owners?)"],
     "current_assets": [r"^total\s+current\s+assets$"],
     "cash": [r"^cash\s+and\s+cash\s+equivalents$", r"^cash,?\s+cash\s+equivalents",
-             r"^cash\s+and\s+(?:cash\s+)?equivalents"],
+             r"^cash\s+and\s+(?:cash\s+)?equivalents",
+             r"^cash$",  # DSGX: bare "Cash" label
+             r"^cash\s+and\s+bank\s+balances?$"],
     "total_liabilities": [r"^total\s+liabilities$",
                           r"^total\s+liabilities\b"],
     "current_liabilities": [r"^total\s+current\s+liabilities$"],
@@ -668,7 +891,7 @@ CF_PATTERNS = {
 def raw_shares_to_m(val):
     """将原始股本数字（不同量级）统一转为 M（百万）单位"""
     if val is None or val <= 0: return None
-    if val >= 1e8: return round(val / 1e6, 2)   # 原始股数（≥1亿）→ M
+    if val >= 1e7: return round(val / 1e6, 2)   # 原始股数（≥1千万）→ M（如 21,821,589 → 21.8M）
     if val >= 1e5: return round(val / 1e3, 2)   # 千股单位（≥10万）→ M
     return round(val, 2)                         # 已是 M
 
@@ -721,6 +944,12 @@ def extract_shares_from_text(text):
                       _search_text, re.I)
         if m:
             _set_ratio(_parse_num_or_word(m.group(1)), _parse_num_or_word(m.group(2)))
+    if not info.ads_per_share:
+        # 模式5: "each ADS represents N share(s) of a common/ordinary share"（如 DDI: 0.05 share of a common share）
+        m = re.search(r"each\s+ADS\s*represents?\s*" + _NUM_PAT + r"\s*(?:share\s+of\s+(?:a\s+)?)?(?:ordinary|common)",
+                      _search_text, re.I)
+        if m:
+            _set_ratio(_parse_num_or_word(m.group(1)), 1.0)
     for pat, stype in [(r"([0-9][0-9,]+)\s*(?:Class\s*[A-Z]\s+)?(?:ordinary|common)\s*shares?"
                         r"\s*(?:issued\s*and\s*)?outstanding", "common"),
                        (r"(?:shares?|stock)\s*outstanding[:\s,]+([0-9][0-9,]+)", "common")]:
@@ -733,6 +962,28 @@ def extract_shares_from_text(text):
     return info
 
 # ═══════════ BS 节区求和（用于没有小计行的报表）═══════════
+def find_section_subtotal(rows, section_start_pat, col, unit_mult=1.0):
+    """找节标题（无数值行）之后第一个无标签的纯数字行，作为小计值返回。
+    适用于 LULU 式报表：'Current assets' 后跟明细行，小计行无标签，之后直接是非流动资产明细。
+    """
+    in_section = False
+    for row in rows:
+        label = build_row_label(row).lower().strip()
+        nums = extract_numbers_from_row(row)
+        if not in_section:
+            if re.search(section_start_pat, label, re.I) and not nums:
+                in_section = True
+            continue
+        # 第一个无标签、有数值的行就是小计行
+        if not label and nums:
+            v = nums[col] if len(nums) > col else nums[0]
+            if v and v > 0:
+                return round(v * unit_mult, 2)
+        # 如果遇到有标签且有数值的行，说明小计在后面还没出现；继续
+        # 如果遇到有标签且无数值（新节标题），不应该出现在此处，继续
+    return None
+
+
 def sum_bs_section(rows, section_start_pat, section_end_pat, col, unit_mult):
     """在 BS 表中找到 section_start_pat 节标题后，累加各明细行数值直到 section_end_pat。
     - 起始行本身必须无数值（纯节标题）
@@ -797,19 +1048,74 @@ def analyze_filing(filepath, ticker="", _silent=False):
             classified[cat].append({"index": i, "rows": rows, "row_count": len(rows),
                                     "unit_label": ul, "unit_mult": um})
 
-    pick = lambda lst: max(lst, key=lambda t: t["row_count"]) if lst else None
+    def _unit_reliability(ul):
+        """Score unit detection reliability: intrinsic > nearby/dom > doc-fallback > unknown.
+        Tables with explicit headers/xbrl/notation are always preferred over doc-fallback.
+        'ones' (Method 4 heuristic) is slightly less reliable than explicit declarations
+        to avoid false positives where a thousands-unit table is misclassified as ones."""
+        if ul in ("thousands", "millions", "billions",
+                  "thousands(xbrl)", "millions(xbrl)", "ones(xbrl)", "billions(xbrl)",
+                  "thousands(notation)"):
+            return 3  # intrinsic declaration
+        if ul in ("ones",):
+            return 2  # Method 4 heuristic: reliable but can false-positive on thousands tables
+        if ul in ("thousands(nearby)", "millions(nearby)", "thousands(nearby-after)",
+                  "millions(nearby-after)", "thousands(dom)", "millions(dom)",
+                  "billions(dom)", "ones(expressed-currency)"):
+            return 1  # contextual inference
+        return 0      # doc-fallback or unknown
+
+    def pick(lst):
+        """Pick the best table: prefer explicit unit declarations, then most rows."""
+        if not lst: return None
+        best_rel = max(_unit_reliability(t["unit_label"]) for t in lst)
+        reliable = [t for t in lst if _unit_reliability(t["unit_label"]) == best_rel]
+        return max(reliable, key=lambda t: t["row_count"])
+
     def pick_is(lst):
         """IS 选表：优先选含 'revenue' 关键词的 GAAP 利润表，排除非 GAAP 调节表"""
         if not lst: return None
         def has_revenue(t):
             top = " ".join(" ".join(r) for r in t["rows"][:8]).lower()
             if re.search(r'\brevenues?\b', top): return True
+            # Also check if any row in the first 8 rows matches a revenue pattern (e.g. MRK: bare "Sales")
+            for row in t["rows"][:8]:
+                lbl = build_row_label(row).lower().strip()
+                if lbl and any(re.match(p, lbl, re.I) for p in IS_PATTERNS["revenue"]):
+                    return True
             # Bank/financial IS tables: revenue appears deeper (after interest income section)
             top30 = " ".join(" ".join(r) for r in t["rows"][:30]).lower()
             return bool(re.search(r'\btotal\s+revenue\b|net\s+interest\s+income', top30))
         def is_nongaap(t):
             full = " ".join(" ".join(r) for r in t["rows"]).lower()
             return full.count("non-gaap") >= 3
+        def is_reconciliation(t):
+            """Detect GAAP/IFRS reconciliation adjustment tables — not the primary P&L."""
+            full = " ".join(" ".join(r) for r in t["rows"][:10]).lower()
+            return bool(re.search(r'ifrs\s+adjustment|gaap\s+reconciliation|reconcil.*?to.*?gaap|as\s+reported\s+under\s+(?:us\s+)?gaap', full))
+        def is_segment_table(t):
+            """Detect segment disclosure tables — multiple segment columns, not a primary P&L."""
+            # Segment tables have "revenue from external/intersegment customers" row labels
+            top = " ".join(" ".join(r) for r in t["rows"][:8]).lower()
+            if re.search(r'revenue\s+from\s+(?:external|intersegment)', top):
+                return True
+            # Segment tables have non-temporal column headers (geography/business-unit names).
+            # Multi-period P&Ls have only temporal headers (years, month-end dates).
+            # Check if any header row has >= 3 non-date column cells (cols 1+) with text.
+            # Temporal cells contain "month", "quarter", "ended", "period", or bare 4-digit years.
+            _temporal_pat = re.compile(
+                r'\b(?:month|quarter|ended|year|period|20\d{2}|19\d{2}|january|february|march'
+                r'|april|may|june|july|august|september|october|november|december)\b', re.I)
+            if t["rows"]:
+                for row in t["rows"][:6]:
+                    nontemporal = sum(
+                        1 for i, c in enumerate(row)
+                        if i > 0 and c.strip() and re.search(r'[a-zA-Z]', c)
+                        and not _temporal_pat.search(c)
+                    )
+                    if nontemporal >= 3:
+                        return True
+            return False
         def is_field_count(t):
             """Count how many IS_PATTERNS fields are matched in this table (quality metric)."""
             count = 0
@@ -820,39 +1126,102 @@ def analyze_filing(filepath, ticker="", _silent=False):
                         count += 1
                         break
             return count
-        gaap = [t for t in lst if not is_nongaap(t)]
-        candidates = gaap if gaap else lst
+        gaap = [t for t in lst if not is_nongaap(t) and not is_reconciliation(t) and not is_segment_table(t)]
+        candidates = gaap if gaap else [t for t in lst if not is_nongaap(t) and not is_reconciliation(t)]
+        candidates = candidates if candidates else [t for t in lst if not is_nongaap(t)]
+        candidates = candidates if candidates else lst
         with_rev = [t for t in candidates if has_revenue(t)]
         candidates = with_rev if with_rev else candidates
+        # Prefer tables with explicit unit declarations over doc-fallback/unknown
+        best_rel = max(_unit_reliability(t["unit_label"]) for t in candidates)
+        reliable = [t for t in candidates if _unit_reliability(t["unit_label"]) == best_rel]
+        candidates = reliable if reliable else candidates
         # Score by (field_matches, row_count) — prefers tables matching more IS fields
         return max(candidates, key=lambda t: (is_field_count(t), t["row_count"]))
     best_is, best_bs, best_cf = pick_is(classified["IS"]), pick(classified["BS"]), pick(classified["CF"])
     if not _silent:
         print(f"[IS={len(classified['IS'])} BS={len(classified['BS'])} CF={len(classified['CF'])}]", end=" ")
 
-    # Step 2: 全局单位（优先取有声明的表）
+    # Step 2: 全局单位（优先取可靠性最高的表）
     gu, gl = 0.0, "unknown"
-    for t in [best_is, best_bs, best_cf]:
-        if t and t["unit_mult"] > 0: gu, gl = t["unit_mult"], t["unit_label"]; break
-    # 次选：任何已分类表
-    if gu == 0:
-        for cat in classified.values():
-            for t in cat:
-                if t["unit_mult"] > 0: gu, gl = t["unit_mult"], t["unit_label"]; break
-            if gu > 0: break
+    _best_gu_rel = -1
+    for t in [best_is, best_bs, best_cf]:  # priority: best tables first
+        if t and t["unit_mult"] > 0:
+            r = _unit_reliability(t["unit_label"])
+            if r > _best_gu_rel:
+                gu, gl, _best_gu_rel = t["unit_mult"], t["unit_label"], r
+    # Also scan ALL classified tables — sometimes best_is has a low-reliability unit
+    # (e.g. 'ones' from Method 4) while another IS/BS table has 'thousands(xbrl)' (rel=3).
+    for cat_tables in classified.values():
+        for t in cat_tables:
+            if t["unit_mult"] > 0:
+                r = _unit_reliability(t["unit_label"])
+                if r > _best_gu_rel:
+                    gu, gl, _best_gu_rel = t["unit_mult"], t["unit_label"], r
 
-    def _um(ti): return ti["unit_mult"] if ti and ti["unit_mult"] > 0 else gu
+    # Per-ticker unit override: for filings that omit explicit "in thousands/millions"
+    # IMPP says "Expressed in United States Dollars" = ones (individual USD)
+    _KNOWN_UNIT_OVERRIDES: Dict[str, float] = {
+        "IMPP":  1e-6,   # Imperial Petroleum: "Expressed in USD" = individual dollars (ones)
+        "IMPPP": 1e-6,   # Same company preferred shares
+    }
+    # Document-level "expressed/presented in [currency]" detection
+    # When a filing declares currency without thousands/millions scale (e.g. "Expressed in United States Dollars",
+    # "Presented in Euros"), values are individual currency units (ones). Set gu=1e-6 to convert to M.
+    if gu == 0:
+        _doc_up = re.sub(r"<[^>]+>", " ", html).upper()
+        _has_scale = bool(re.search(r"IN\s+THOUSANDS|IN\s+MILLIONS|IN\s+BILLIONS", _doc_up))
+        if not _has_scale:
+            _currency_pat = (r"(?:EXPRESSED|PRESENTED|STATED|DENOMINATED)\s+IN\s+"
+                             r"(?:UNITED\s+STATES\s+DOLLARS|US\s+DOLLARS|EUROS?|EUR\b|"
+                             r"BRITISH\s+POUNDS?|GBP\b|CANADIAN\s+DOLLARS?|CAD\b|"
+                             r"NORWEGIAN\s+KRONE|NOK\b|SWEDISH\s+KRONOR|SEK\b|"
+                             r"SWISS\s+FRANCS?|CHF\b|JAPANESE\s+YEN|JPY\b)")
+            # Exclude "CURRENCY EXPRESSED IN ..." — that phrase just names the currency,
+            # not the scale (e.g. MWG: "Currency expressed in USD" but values are in $'000).
+            _has_currency_qualifier = bool(re.search(r"CURRENCY\s+EXPRESSED\s+IN", _doc_up))
+            if re.search(_currency_pat, _doc_up) and not _has_currency_qualifier:
+                gu, gl = 1e-6, "ones(expressed-currency)"
+            # Also catch "(in USD)" / "(in U.S. dollars)" parenthetical — common in smaller filings
+            elif re.search(r"\(\s*IN\s+(?:USD|U\.S\.\s+DOLLARS?|US\s+DOLLARS?)\s*[,)]", _doc_up):
+                gu, gl = 1e-6, "ones(expressed-currency)"
+    if gu == 0:
+        _uoverride = _KNOWN_UNIT_OVERRIDES.get(d.ticker.upper())
+        if _uoverride:
+            if abs(_uoverride - 1e-6) < 1e-12: _ulabel = "ones(override)"
+            elif abs(_uoverride - 0.001) < 1e-9: _ulabel = "thousands(override)"
+            else: _ulabel = "millions(override)"
+            gu, gl = _uoverride, _ulabel
+    def _um(ti):
+        if not ti or ti["unit_mult"] <= 0: return gu
+        # Fall back to global unit when it's more reliable (e.g. table=ones heuristic,
+        # global=thousands(xbrl) from another table in the same document).
+        if gu > 0 and _unit_reliability(ti["unit_label"]) < _unit_reliability(gl):
+            return gu
+        return ti["unit_mult"]
     def ap(val, ti, is_eps=False):
         if val is None: return None
         if is_eps: return val
         um = _um(ti)
         return round(val * um, 2) if um > 0 else val
+    # Pre-set d.unit_multiplier = gu so that Step 4 auto-infer triggers when gu==0.
+    # Without this, filings with no IS table (best_is=None) keep the default 1.0,
+    # preventing auto-infer and leaving raw BS values unscaled (e.g. API: 721099 → 721099M).
+    d.unit_multiplier = gu
 
     # Step 3: 三大报表
     if best_is:
         is_col = detect_latest_column(best_is["rows"])
         isd = extract_from_table(best_is["rows"], IS_PATTERNS, col=is_col)
         d.revenue = ap(isd["revenue"], best_is)
+        # Fallback: revenue may be an unlabeled subtotal row under a "Revenues:" section header
+        # (e.g. HOLX: "Revenues:" header → Product + Service lines → unlabeled total)
+        if d.revenue is None:
+            _rev_unlabeled = find_section_subtotal(
+                best_is["rows"], r"^revenues?:?$", is_col,
+                unit_mult=_um(best_is) if _um(best_is) > 0 else 1.0)
+            if _rev_unlabeled:
+                d.revenue = _rev_unlabeled
         d.cost_of_revenue = ap(isd["cost_of_revenue"], best_is)
         d.gross_profit = ap(isd["gross_profit"], best_is)
         d.operating_expenses = ap(isd["operating_expenses"], best_is)
@@ -868,8 +1237,10 @@ def analyze_filing(filepath, ticker="", _silent=False):
         d.interest_expense = ap(isd.get("interest_expense"), best_is)
         d.income_tax = ap(isd.get("income_tax"), best_is)
         d.pretax_income = ap(isd.get("pretax_income"), best_is)
-        d.unit_label = best_is["unit_label"] if best_is["unit_mult"] > 0 else gl
-        d.unit_multiplier = _um(best_is)
+        _eff_um = _um(best_is)
+        d.unit_multiplier = _eff_um
+        # Use global unit label when _um fell back to gu (table unit was less reliable)
+        d.unit_label = gl if (gu > 0 and _eff_um == gu and best_is["unit_label"] != gl) else (best_is["unit_label"] if best_is["unit_mult"] > 0 else gl)
         # Bank: non-interest expense may appear as section header with no aggregate value;
         # sum sub-items between header and next major section.
         # Use raw unit (1.0) when unit_mult=0 so step-4 auto-scaling handles it.
@@ -942,37 +1313,65 @@ def analyze_filing(filepath, ticker="", _silent=False):
         if in_thousands is True:
             result = round(v / 1000, 2)
             # 健全性：若 result > 30B，v 极可能是原始股数（raw count），而非 thousands 单位
-            # 例如 IH: 54,011,420 raw ADSs in a thousands table → /1000 = 54011M (wrong)
-            # 应以 raw_shares_to_m 逻辑处理：v/1e6 = 54.01M (正确)
+            # 例如 IH: 54,011,420 raw ADSs in a thousands table → /1000=54011M(wrong) → /1e6=54M(✓)
             if result > 30_000:
                 return round(v / 1e6, 2)
             return result
         elif in_thousands is False:
-            # 表单位 millions，但股本行可能采用混合单位（如 Apple：金融数据 millions，股数 thousands）
-            # v > 1e6 时：若是真正百万单位则代表 >1万亿股（不合理），说明实际是 thousands 单位
-            if v > 1e6:
-                result = round(v / 1e3, 2)
-                # 若结果仍 >30B，说明 v 是原始股数（raw count），直接 /1e6
-                if result > 30_000:
-                    return round(v / 1e6, 2)
-                return result
-            return round(v, 2)   # 已是 M，不再除以 1000
+            # 股数是原始计数（raw count），如 "in thousands except share data"
+            # v >= 1e6 → 除以 1e6 转为 M；否则视为已是 M
+            if v >= 1e6:
+                return round(v / 1e6, 2)
+            return round(v, 2)   # 已是 M（如中国公司以百万为单位列示股数）
         else:
-            if v > 1e8: return round(v / 1e6, 2)
+            if v >= 1e7: return round(v / 1e6, 2)
             if v > 10000: return round(v / 1000, 2)
             return round(v, 2)
 
-    for is_tbl in classified["IS"]:
+    # Process IS tables ordered by unit reliability (highest first) so that XBRL-annotated
+    # or explicit-header tables take priority over Method 4 'ones' heuristic tables.
+    # This prevents ones-unit tables (reliability=2) from overriding correctly-detected
+    # thousands/millions tables (reliability=3) in the shares extraction loop.
+    _is_ordered = sorted(classified["IS"], key=lambda t: _unit_reliability(t["unit_label"]), reverse=True)
+    for is_tbl in _is_ordered:
         sc_col = detect_latest_column(is_tbl["rows"])
         tbl_txt = " ".join(" ".join(r) for r in is_tbl["rows"][:20])
         sb, sd, sh_ik, _ads_flag = extract_shares_contextual(is_tbl["rows"], sc_col, tbl_txt)
-        if sb and sb > 100: d.shares.weighted_avg = shares_to_m(sb, sh_ik)
-        if sd and sd > 100: d.shares.diluted = shares_to_m(sd, sh_ik)
-        if _ads_flag: d.shares.wtdavg_already_ads = True
-        if d.shares.weighted_avg or d.shares.diluted: break
+        _tbl_um = is_tbl.get("unit_mult", 0)
+        # Override sh_ik using the table's detected unit_mult when the table text itself
+        # does not contain the unit declaration (e.g. NTES: "thousands" is in nearby HTML).
+        # Respect "except share/per-share" clauses which mean shares are NOT in thousands.
+        if _tbl_um > 0 and not re.search(r"except\s+(?:for\s+)?(?:share|per[\s\-]share)", tbl_txt, re.I):
+            if abs(_tbl_um - 0.001) < 1e-9: sh_ik = True   # thousands table
+            elif abs(_tbl_um - 1.0) < 1e-9: sh_ik = False  # millions table
+        # Additional positive check: filing explicitly says shares are reflected in thousands
+        # (e.g. AAPL: "in millions, except number of shares which are reflected in thousands")
+        # The "except number of shares" pattern doesn't match the regex above, so re-check here.
+        if re.search(r"reflected\s+in\s+thousands", tbl_txt, re.I):
+            sh_ik = True
+        def _sh_m(v):
+            if not v or v <= 100: return None
+            # "ones" 表（unit_mult ≈ 1e-6）：原始股数直接 /1e6 → M
+            if abs(_tbl_um - 1e-6) < 1e-9:
+                return round(v / 1e6, 2)
+            return shares_to_m(v, sh_ik)
+        # In a millions-unit table with sh_ik=False, raw share values >= 1e6 are suspicious:
+        # the shares are likely in thousands within a mixed-unit table (e.g. AAPL 10-K/10-Q where
+        # XBRL decimals=-6 wins majority but share rows have decimals=-3).
+        # Skip storing these — the SHARES_PATTERNS fallback will find a dedicated thousands table.
+        _raw_sh = max(sb or 0, sd or 0)
+        _suspicious = (abs(_tbl_um - 1.0) < 1e-9 and sh_ik != True and _raw_sh >= 1e6)
+        if not _suspicious:
+            if sb and sb > 100: d.shares.weighted_avg = _sh_m(sb)
+            if sd and sd > 100: d.shares.diluted = _sh_m(sd)
+            if _ads_flag: d.shares.wtdavg_already_ads = True
+            if d.shares.weighted_avg or d.shares.diluted:
+                break
     if not d.shares.weighted_avg and not d.shares.diluted:
-        # Build expanded table list: IS + BS + CF + any table with "weighted"/"shares"
-        _search = classified["IS"][:] + classified["BS"][:] + classified["CF"][:]
+        # Build expanded table list: IS + BS + any table with "weighted"/"shares".
+        # Exclude CF tables: cash flow statements contain items like "Issuance of ordinary shares: $25,000"
+        # which SHARES_PATTERNS can falsely match, producing dollar amounts as share counts.
+        _search = classified["IS"][:] + classified["BS"][:]
         for ii, table in enumerate(all_tables):
             txt = table.get_text(separator=" ", strip=True).lower()
             if ("weighted" in txt and "share" in txt) or "earnings per share" in txt:
@@ -981,25 +1380,136 @@ def analyze_filing(filepath, ticker="", _silent=False):
                     ul2, um2 = detect_table_unit(table, html)
                     _search.append({"index": ii, "rows": rr, "row_count": len(rr), "unit_label": ul2, "unit_mult": um2})
         for stbl in _search:
+            # Skip anti-dilutive disclosure tables: they report the number of shares EXCLUDED
+            # from diluted EPS (not the total share count). e.g. NUE: anti-dilutive table has
+            # "Weighted-average shares: 164" (164K excluded shares, not 164M total shares).
+            _antidilut_check = " ".join(" ".join(r) for r in stbl["rows"][:5]).lower()
+            if re.search(r'anti.?dilut', _antidilut_check):
+                continue
             sc = detect_latest_column(stbl["rows"])
             tt = " ".join(" ".join(r) for r in stbl["rows"][:20])
-            ik = "thousand" in tt.lower()
+            _stbl_um = stbl.get("unit_mult", 0)
+            _has_except = bool(re.search(r"except\s+(?:for\s+)?(?:share|per[\s\-]share)", tt, re.I))
+            if _stbl_um > 0:
+                if _has_except:
+                    ik = False  # "except share data" → shares are raw counts, not scaled by table unit
+                elif abs(_stbl_um - 0.001) < 1e-9:
+                    ik = True   # thousands table, no exception → shares also in thousands
+                elif abs(_stbl_um - 1.0) < 1e-9:
+                    ik = False  # millions table
+                else:
+                    ik = "thousand" in tt.lower()
+            else:
+                ik = "thousand" in tt.lower()
+            # Same positive check: shares reflected in thousands within a millions table
+            if re.search(r"reflected\s+in\s+thousands", tt, re.I):
+                ik = True
             shd = extract_from_table(stbl["rows"], SHARES_PATTERNS, col=sc)
             sb, sd = shd.get("shares_basic"), shd.get("shares_diluted")
-            if sb and sb > 100: d.shares.weighted_avg = shares_to_m(sb, ik)
-            if sd and sd > 100: d.shares.diluted = shares_to_m(sd, ik)
+            # Use result-based threshold (>= 0.1M) instead of raw value > 100,
+            # so that millions-unit tables where shares appear as small numbers (e.g. 32.4)
+            # are correctly stored (e.g. BKNG: 32.4M in millions table → raw 32.4 ≤ 100 but result=32.4M).
+            _sb_m = shares_to_m(sb, ik) if (sb and sb > 0) else None
+            _sd_m = shares_to_m(sd, ik) if (sd and sd > 0) else None
+            if _sb_m and _sb_m >= 0.1: d.shares.weighted_avg = _sb_m
+            if _sd_m and _sd_m >= 0.1: d.shares.diluted = _sd_m
             # 检测 IS 是否以 ADS 为单位报告加权平均
             if re.search(r'\bads[s]?\b', tt, re.I): d.shares.wtdavg_already_ads = True
             if d.shares.weighted_avg or d.shares.diluted: break
 
+    if d.shares.diluted and not d.shares.weighted_avg:
+        d.shares.weighted_avg = d.shares.diluted
+
+    # Sanity: diluted shares must be >= weighted_avg (basic). If diluted is dramatically smaller
+    # than weighted_avg, the "diluted" value likely came from a dilutive-effect row (incremental
+    # shares from options/RSUs) rather than the total diluted shares count.
+    # E.g. BKNG: weighted_avg=32.45M (correct basic) but diluted=0.187M (dilutive effect only).
+    if d.shares.diluted and d.shares.weighted_avg:
+        if d.shares.diluted < d.shares.weighted_avg * 0.5:
+            d.shares.diluted = d.shares.weighted_avg  # replace bad diluted with basic count
+
+    # Also propagate weighted_avg → diluted so EPS cross-val (which checks diluted) can fire
+    # when only weighted_avg was found (e.g. HCA: basic row found but diluted row absent).
+    if d.shares.weighted_avg and not d.shares.diluted:
+        d.shares.diluted = d.shares.weighted_avg
+
+    # EPS cross-validation: if eps and net_income are available, verify share scale.
+    # Detects cases where shares are off by 1000x due to missing "except share data" clause
+    # in a thousands-unit table (e.g. BRIA: raw=23342466 shares in USD'000 table → /1000 wrong).
+    _eps_for_xval = d.eps_diluted or d.eps_basic  # use diluted, fall back to basic
+    if _eps_for_xval and d.net_income and d.shares.diluted:
+        _eps_check = abs(_eps_for_xval)
+        _ni_check = abs(d.net_income)
+        _sh_check = d.shares.diluted
+        if _eps_check > 0 and _sh_check > 0:
+            _eps_computed = _ni_check / _sh_check
+            _ratio = _eps_computed / _eps_check
+            if _ratio < 0.005:    # shares ~200x too large → /1000
+                _f = round(1 / _ratio)
+                if abs(_f - 1000) < 200:  # only correct if ratio is close to 1000
+                    d.shares.diluted = round(d.shares.diluted / 1000, 2)
+                    if d.shares.weighted_avg:
+                        d.shares.weighted_avg = round(d.shares.weighted_avg / 1000, 2)
+            elif _ratio > 200:    # shares ~200x too small → *1000
+                _f = round(_ratio)
+                if abs(_f - 1000) < 200:
+                    d.shares.diluted = round(d.shares.diluted * 1000, 2)
+                    if d.shares.weighted_avg:
+                        d.shares.weighted_avg = round(d.shares.weighted_avg * 1000, 2)
+
     # BS: merge ALL BS tables (some filings split Assets / Liabilities into separate tables)
+    # Process best_bs first so its values have priority over secondary/notes tables
     if classified["BS"]:
-        for bs_tbl in classified["BS"]:
+        bs_order = ([best_bs] if best_bs else []) + [t for t in classified["BS"] if t is not best_bs]
+        for bs_tbl in bs_order:
             bs_col = detect_latest_column(bs_tbl["rows"])
             bsd = extract_from_table(bs_tbl["rows"], BS_PATTERNS, col=bs_col)
+            # Scale consistency check for secondary BS tables: if this table's total_assets
+            # disagrees with the already-stored value by >10x, its unit detection is wrong
+            # (e.g. HCM: best_bs=thousands but secondary=millions(doc) with SAME raw values →
+            # secondary gives 1000x inflated current_assets, equity, etc.).
+            # Apply a correction factor so the secondary table's values are still usable.
+            _bs_scale_correction = 1.0
+            if bs_tbl is not best_bs and d.total_assets and bsd.get("total_assets") is not None:
+                _sec_ta = ap(bsd["total_assets"], bs_tbl)
+                if _sec_ta and _sec_ta > 0 and d.total_assets > 0:
+                    _scale_ratio = _sec_ta / d.total_assets
+                    if _scale_ratio > 10 or _scale_ratio < 0.1:
+                        _bs_scale_correction = d.total_assets / _sec_ta  # rescale to match best_bs
             for k in BS_PATTERNS:
                 if getattr(d, k) is None and bsd[k] is not None:
-                    setattr(d, k, ap(bsd[k], bs_tbl))
+                    _raw_val = ap(bsd[k], bs_tbl)
+                    if _raw_val is not None:
+                        setattr(d, k, round(_raw_val * _bs_scale_correction, 2))
+
+        # Sanity: reject total_assets from secondary tables if it's less than current_assets
+        # (physically impossible — means the secondary table is a notes/subsidiary table).
+        if d.total_assets is not None and d.current_assets is not None:
+            if d.total_assets < d.current_assets:
+                d.total_assets = None
+
+        # Fallback: some filings (e.g. MRK) have "Total Assets" as an unlabeled row in best_bs.
+        # Detect by finding the last unlabeled row in the assets section with value > current_assets.
+        if d.total_assets is None and d.current_assets is not None and best_bs:
+            _rows_ta = best_bs["rows"]
+            _um_ta = best_bs["unit_mult"] if best_bs["unit_mult"] > 0 else 1.0
+            _col_ta = detect_latest_column(_rows_ta)
+            _in_assets = False
+            _unlabeled_ta = None
+            for _row_ta in _rows_ta:
+                _lbl_ta = build_row_label(_row_ta).lower().strip()
+                _nums_ta = extract_numbers_from_row(_row_ta)
+                if re.search(r"^assets?$", _lbl_ta, re.I) and not _nums_ta:
+                    _in_assets = True
+                    continue
+                if _in_assets and _lbl_ta and re.search(r"^liabilit", _lbl_ta, re.I):
+                    break
+                if _in_assets and not _lbl_ta and _nums_ta:
+                    _v_ta = _nums_ta[_col_ta] if len(_nums_ta) > _col_ta else _nums_ta[0]
+                    if _v_ta is not None and _v_ta > 0 and _v_ta * _um_ta > d.current_assets:
+                        _unlabeled_ta = round(_v_ta * _um_ta, 2)
+            if _unlabeled_ta:
+                d.total_assets = _unlabeled_ta
 
     # CF: merge ALL CF tables (some filings split operating/investing/financing into separate tables)
     if classified["CF"]:
@@ -1016,8 +1526,10 @@ def analyze_filing(filepath, ticker="", _silent=False):
     if d.unit_multiplier == 0:
         vals = [v for v in [d.revenue, d.total_assets, d.net_income, d.operating_cf] if v and v > 0]
         if vals:
-            med = sorted(vals)[len(vals)//2]
-            mult = 0.001 if med > 1e5 else 1.0
+            # Use max: if ANY reference value > 1e5, values are likely in thousands (not millions).
+            # Median was too conservative — e.g. a company with revenue=38K but assets=721K
+            # would have median 38K < 1e5, giving mult=1.0 (treating 721K as 721B).
+            mult = 0.001 if max(vals) > 1e5 else 1.0
             d.unit_multiplier = mult
             d.unit_label = "auto(thousands->M)" if mult == 0.001 else "auto(=M)"
             for attr in ["revenue","cost_of_revenue","gross_profit","operating_expenses",
@@ -1083,13 +1595,56 @@ def analyze_filing(filepath, ticker="", _silent=False):
             bs_col = detect_latest_column(bs_tbl["rows"])
             um = _um(bs_tbl)
             if d.current_assets is None:
-                v = sum_bs_section(bs_tbl["rows"], r"^current\s+assets?$",
-                                   r"^non[\s-]*current\s+assets?|^total\s+assets", bs_col, um)
+                # 优先：找节标题后第一个无标签纯数字行（如 LULU 式报表）
+                v = find_section_subtotal(bs_tbl["rows"], r"^current\s+assets?$", bs_col, um)
+                # 回退：逐项求和（适用于无小计行的报表）
+                if v is None:
+                    v = sum_bs_section(bs_tbl["rows"], r"^current\s+assets?$",
+                                       r"^non[\s-]*current\s+assets?|^total\s+assets", bs_col, um)
+                # 合理性保护：流动资产不能超过总资产
+                if v and d.total_assets and v > d.total_assets:
+                    v = None
                 if v: d.current_assets = v
             if d.current_liabilities is None:
-                v = sum_bs_section(bs_tbl["rows"], r"^current\s+liabilit",
-                                   r"^non[\s-]*current\s+liabilit|^total\s+liabilit", bs_col, um)
+                v = find_section_subtotal(bs_tbl["rows"], r"^current\s+liabilit", bs_col, um)
+                if v is None:
+                    v = sum_bs_section(bs_tbl["rows"], r"^current\s+liabilit",
+                                       r"^non[\s-]*current\s+liabilit|^total\s+liabilit", bs_col, um)
+                if v and d.total_liabilities and v > d.total_liabilities:
+                    v = None
                 if v: d.current_liabilities = v
+
+    # ── 推导3b：总资产/总负债（BS 无明确合计行时逐项求和）────────────────────
+    if (d.total_assets is None or d.total_liabilities is None) and classified["BS"]:
+        for bs_tbl in classified["BS"]:
+            bs_col = detect_latest_column(bs_tbl["rows"])
+            _sum_um = _um(bs_tbl) if _um(bs_tbl) > 0 else 1.0
+            if d.total_assets is None:
+                v = sum_bs_section(bs_tbl["rows"], r"^assets?$",
+                                   r"^liabilit", bs_col, _sum_um)
+                if v: d.total_assets = v
+            if d.total_liabilities is None:
+                v = sum_bs_section(bs_tbl["rows"],
+                                   r"^liabilities\s+and\s+shareholders|^liabilities\s+and\s+stockholders|^liabilities$",
+                                   r"^shareholders.?\s+equity|^stockholders.?\s+equity|^owners.?\s+equity",
+                                   bs_col, _sum_um)
+                if v: d.total_liabilities = v
+    if d.total_equity is None and d.total_assets is not None and d.total_liabilities is not None:
+        derived_eq = round(d.total_assets - d.total_liabilities, 2)
+        if derived_eq > 0:
+            d.total_equity = derived_eq
+    # Reverse: derive total_liabilities = total_assets - total_equity.
+    # Also use this to fix clearly-wrong extractions (< 0.1% of total assets = from a notes table).
+    if d.total_assets is not None and d.total_equity is not None:
+        derived_liab = round(d.total_assets - d.total_equity, 2)
+        if derived_liab > 0:
+            if d.total_liabilities is None:
+                d.total_liabilities = derived_liab
+            elif d.total_liabilities < d.total_assets * 0.001:
+                # total_liabilities < 0.1% of total_assets: almost certainly from a supplemental
+                # notes table (e.g. RACE: financial instruments fair value table), not the main BS.
+                d.total_liabilities = derived_liab
+
     ts = extract_shares_from_text(text)
     if not d.shares.common: d.shares.common = ts.common
     if not d.shares.weighted_avg: d.shares.weighted_avg = ts.weighted_avg
@@ -1119,9 +1674,6 @@ def analyze_filing(filepath, ticker="", _silent=False):
                     break
             if d.shares.common: break
 
-    # 如果 common 仍然为空，用 weighted_avg 基本股数作为近似值
-    if not d.shares.common and d.shares.weighted_avg:
-        d.shares.common = d.shares.weighted_avg
     if not d.shares.ads_ratio: d.shares.ads_ratio = ts.ads_ratio
     if not d.shares.ads_per_share and ts.ads_per_share: d.shares.ads_per_share = ts.ads_per_share
     d.shares.details.extend(ts.details)
@@ -1139,6 +1691,10 @@ def analyze_filing(filepath, ticker="", _silent=False):
         "LX":   2.0,   # LexinFintech: 1 ADS = 2 ordinary (changed from 5)
         "TAL":  0.3333, # TAL Education: 3 ADS = 1 ordinary → 1 ADS = 1/3 ordinary
         "JD":   2.0,    # JD.com: 1 ADS = 2 ordinary
+        "WDH":  10.0,   # Waterdrop: 1 ADS = 10 Class A ordinary
+        "DQ":   5.0,    # Daqo New Energy: 1 ADS = 5 ordinary
+        "DDI":  0.05,   # DoubleDown Interactive: 1 ADS = 0.05 ordinary (20 ADS = 1 ordinary)
+        "NTES": 5.0,    # NetEase: 1 ADS = 5 ordinary shares (changed from 25 in 2021)
     }
     if not d.shares.ads_per_share:
         _fallback = _KNOWN_ADS_RATIOS.get(d.ticker.upper())
@@ -1171,6 +1727,11 @@ def analyze_filing(filepath, ticker="", _silent=False):
             if d.eps_diluted is not None and abs(d.eps_diluted) * ratio < 500:
                 d.eps_diluted = round(d.eps_diluted * ratio, 4)
 
+    # 如果 common 仍然为空，用 weighted_avg 基本股数作为近似值
+    # （此时 weighted_avg 已经过 ADS 比例修正，可直接作为 ADS 口径使用）
+    if not d.shares.common and d.shares.weighted_avg:
+        d.shares.common = d.shares.weighted_avg
+
     # 股本合理性修正：XBRL 文件有时将原始股数（raw count）放在 thousands 单位表中
     # 症状：shares > 30,000M（300亿）时，/ 1000 后更合理（绝大多数公司 < 300亿股）
     _SHARE_MAX_M = 30_000
@@ -1180,6 +1741,13 @@ def analyze_filing(filepath, ticker="", _silent=False):
             _fixed = round(_sv / 1000, 2)
             if _fixed <= _SHARE_MAX_M:
                 setattr(d.shares, _attr, _fixed)
+    # 二次校验：basic/common > diluted × 10 说明单位仍错了 1000 倍（如 DSP）
+    _ref = d.shares.diluted or d.shares.weighted_avg
+    if _ref:
+        for _attr in ("weighted_avg", "common"):
+            _sv = getattr(d.shares, _attr)
+            if _sv and _sv > _ref * 10:
+                setattr(d.shares, _attr, round(_sv / 1000, 2))
 
     # 比率
     if d.revenue and d.revenue != 0:

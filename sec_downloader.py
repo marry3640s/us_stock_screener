@@ -43,7 +43,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 # ─── 配置 ──────────────────────────────────────────────────────────────────────
-TICKER_FILE   = "tickers.txt"
+TICKER_FILE   = "all_tickers.txt"
 OUTPUT_DIR    = "sec-data"
 
 # 并发 ticker 数量（建议 3~8，过高会被 SEC 限流）
@@ -272,8 +272,15 @@ _EX99_RE = re.compile(
 )
 
 def _has_financial_keywords(text: str) -> bool:
-    """收入表或资产负债表关键词命中任意一类即返回 True。"""
-    return bool(_INCOME_RE.search(text)) or bool(_BALANCE_RE.search(text))
+    """
+    判断是否为财务报表：
+      收入表关键词命中 >= 5 次，或资产负债表关键词命中 >= 3 次。
+      纯新闻稿/通知类 6-K 偶尔会提到 1-2 次收入，不会触发阈值。
+    """
+    income_count  = len(_INCOME_RE.findall(text))
+    balance_count = len(_BALANCE_RE.findall(text))
+    log.debug(f"    收入表关键词: {income_count} 次, 资产负债表关键词: {balance_count} 次")
+    return income_count >= 5 or balance_count >= 3
 
 
 def is_financial_6k(save_path: Path, txt_url: str) -> bool:
