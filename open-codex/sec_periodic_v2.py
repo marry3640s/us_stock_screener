@@ -82,6 +82,130 @@ def _extract_periodic_capex_from_narrative(base, lines: list[str]) -> float | No
     return None
 
 
+def _is_financial_like_periodic(base, report, lines: list[str]) -> bool:
+    company_norm = base._normalize_label(report.company_name or "")
+    preview = base._normalize_label(" ".join(lines[:3000]))
+    company_signals = (
+        "bank",
+        "banc",
+        "brokers",
+        "broker",
+        "financial",
+        "insurance",
+        "securities",
+        "capital markets",
+    )
+    text_signals = (
+        "net revenues",
+        "income before income taxes",
+        "total liabilities and equity",
+        "brokerage industry",
+        "net interest income",
+        "insurance contract liabilities",
+    )
+    if any(token in company_norm for token in company_signals):
+        return True
+    hits = sum(1 for token in text_signals if token in preview)
+    return hits >= 3
+
+
+def _extract_financial_like_summary_amount(base, preview_text: str, patterns: list[str]) -> float | None:
+    for pattern in patterns:
+        match = re.search(pattern, preview_text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        amount = base._parse_number(match.group("amount"))
+        if amount is None:
+            continue
+        unit = (match.groupdict().get("unit") or "").lower()
+        multiplier = {
+            "thousand": 1_000.0,
+            "million": 1_000_000.0,
+            "billion": 1_000_000_000.0,
+            "trillion": 1_000_000_000_000.0,
+        }.get(unit, 1.0)
+        return amount * multiplier
+    return None
+
+
+def _extract_financial_like_row_values(base, lines: list[str], labels: list[str]) -> list[float] | None:
+    normalized_labels = [base._normalize_label(label) for label in labels]
+    for idx, line in enumerate(lines):
+        normalized_line = base._normalize_label(line)
+        if not any(normalized_line == label or label in normalized_line for label in normalized_labels):
+            continue
+        values: list[float] = []
+        for follow in lines[idx + 1 : min(len(lines), idx + 12)]:
+            cleaned = base._clean_text(follow)
+            parsed = base._parse_number(cleaned)
+            if parsed is not None:
+                values.append(parsed)
+                continue
+            if values and re.search(r"[A-Za-z]", cleaned):
+                break
+        if values:
+            return values
+    return None
+
+
+def _extract_financial_like_balance_sheet_total_equity(base, lines: list[str], multiplier: float) -> float | None:
+    for idx, line in enumerate(lines):
+        if base._normalize_label(line) != "total equity":
+            continue
+        values: list[float] = []
+        for follow in lines[idx + 1 : min(len(lines), idx + 8)]:
+            cleaned = base._clean_text(follow)
+            parsed = base._parse_number(cleaned)
+            if parsed is not None:
+                values.append(parsed)
+                continue
+            if values and re.search(r"[A-Za-z]", cleaned):
+                break
+        if values:
+            return values[0] * multiplier
+    return None
+
+
+def _apply_financial_like_periodic_overrides(base, report, lines: list[str]) -> None:
+    multiplier = base._unit_multiplier(report.currency_unit)
+    preview = base._clean_text(" ".join(lines[:2500]))
+
+    financial_revenue = _extract_financial_like_summary_amount(
+        base,
+        preview,
+        [
+            r"net revenues? were\s+\$?\s*(?P<amount>[0-9][0-9,]*(?:\.\d+)?)\s*(?P<unit>thousand|million|billion|trillion)\b",
+            r"total net revenues?,?\s+for the current year, increased[^.]{0,120}?to\s+\$?\s*(?P<amount>[0-9][0-9,]*(?:\.\d+)?)\s*(?P<unit>thousand|million|billion|trillion)\b",
+        ],
+    )
+    if financial_revenue is None and multiplier > 1.0:
+        revenue_row = _extract_financial_like_row_values(base, lines, ["Total net revenues", "Net revenues"])
+        if revenue_row:
+            financial_revenue = revenue_row[0] * multiplier
+    if financial_revenue is not None and (
+        report.revenue is None
+        or report.revenue <= 0
+        or report.revenue < financial_revenue * 0.5
+        or report.revenue > financial_revenue * 1.5
+    ):
+        report.revenue = financial_revenue
+
+    if multiplier > 1.0:
+        equity_value = _extract_financial_like_balance_sheet_total_equity(base, lines, multiplier)
+        if equity_value is not None:
+            report.equity = equity_value
+
+    if report.total_assets is not None and report.total_liabilities is not None:
+        derived_equity = report.total_assets - report.total_liabilities
+        if report.equity is None:
+            report.equity = derived_equity
+        else:
+            gap = abs(report.equity - derived_equity)
+            tolerance = max(1.0, abs(derived_equity) * 0.1)
+            if gap > tolerance:
+                report.equity = derived_equity
+
+
 def _apply_periodic_fallbacks(base, report, facts_by_name, contexts, target_end, lines: list[str]) -> None:
     if report.interest_income is not None and report.interest_income < 0:
         report.interest_income = None
@@ -282,5 +406,7 @@ def parse_periodic_filing_v2(path: Path):
 
     base._maybe_correct_duplicate_thousand_scale_annual_report(report, lines, statement_currency_unit)
     _apply_periodic_fallbacks(base, report, facts_by_name, contexts, target_end, lines)
+    if _is_financial_like_periodic(base, report, lines):
+        _apply_financial_like_periodic_overrides(base, report, lines)
     _finalize_periodic_report(base, report)
     return report
