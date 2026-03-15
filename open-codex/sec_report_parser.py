@@ -31,6 +31,17 @@ MAX_FACT_DATE_GAP_DAYS = 200
 DEFAULT_PROGRESS_EVERY = 50
 DEFAULT_FILE_TIMEOUT_SECONDS = 45.0
 DEFAULT_SEC_DATA_DIR = "/Users/guowenyong/sec-data"
+WARRANT_LIKE_TICKER_SUFFIXES = ("W", "WS", "WT", "WTS")
+WARRANT_LIKE_KEYWORDS = (
+    "warrantmember",
+    "public warrant",
+    "private warrant",
+    "redeemable warrant",
+    "warrant to purchase",
+    "warrants to purchase",
+    "warrants exercisable",
+    "warrant",
+)
 
 FORM_EXPLANATIONS = {
     "10-K": "美股发行人的年度报告，覆盖完整财年。",
@@ -1181,6 +1192,24 @@ def _infer_currency_unit_from_statement_headers(lines: list[str]) -> str | None:
 def _extract_currency_unit(raw: str) -> str | None:
     visible_raw = re.sub(r"(?is)<ix:header\b.*?</ix:header>", " ", raw)
     lines = _strip_html_to_lines(visible_raw)
+    reporting_currency_text = "\n".join(lines[:4000])
+    for code, pattern in {
+        "CAD": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:canadian dollars?|cad|c\$)\b",
+        "BRL": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:brazilian reais?|brazilian real|reais|brl|r\$)\b",
+        "CNY": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:renminbi|rmb|cny)\b",
+        "HKD": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:hong kong dollars?|hkd|hk\$)\b",
+        "EUR": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:euros?|eur|€)\b",
+        "GBP": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:pounds? sterling|gbp)\b",
+        "JPY": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:yen|jpy)\b",
+        "KRW": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:korean won|krw)\b",
+        "TWD": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:new taiwan dollars?|nt\$|twd)\b",
+        "USD": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:u\.?s\.?\s*dollars?|usd|us\$)\b",
+        "INR": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:indian rupees?|inr|₹)\b",
+    }.items():
+        if re.search(pattern, reporting_currency_text):
+            if code != "USD":
+                return code
+            break
     statement_currency_unit = _infer_currency_unit_from_statement_headers(lines)
     if statement_currency_unit is not None:
         return statement_currency_unit
@@ -1257,6 +1286,24 @@ def _extract_currency_unit(raw: str) -> str | None:
             counts[code] = counts.get(code, 0) + 1
         primary_xbrl_currency = max(counts.items(), key=lambda item: (item[1], item[0]))[0]
 
+    reporting_currency = None
+    for code, pattern in {
+        "CAD": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:canadian dollars?|cad|c\$)\b",
+        "BRL": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:brazilian reais?|brazilian real|reais|brl|r\$)\b",
+        "CNY": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:renminbi|rmb|cny)\b",
+        "HKD": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:hong kong dollars?|hkd|hk\$)\b",
+        "EUR": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:euros?|eur|€)\b",
+        "GBP": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:pounds? sterling|gbp)\b",
+        "JPY": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:yen|jpy)\b",
+        "KRW": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:korean won|krw)\b",
+        "TWD": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:new taiwan dollars?|nt\$|twd)\b",
+        "USD": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:u\.?s\.?\s*dollars?|usd|us\$)\b",
+        "INR": r"(?i)\bour\s+reporting\s+currency\s+is\s+(?:the\s+)?(?:indian rupees?|inr|₹)\b",
+    }.items():
+        if re.search(pattern, reporting_currency_text):
+            reporting_currency = code
+            break
+
     currency = None
     for code, patterns in {
         "CAD": [r"\bCAD(?=\b|[0-9])", r"\bCanadian dollars?\b", r"\bC\$(?=\b|[0-9])"],
@@ -1273,6 +1320,8 @@ def _extract_currency_unit(raw: str) -> str | None:
         if any(re.search(pattern, lead_text, flags=re.IGNORECASE) for pattern in patterns):
             currency = code
             break
+    if reporting_currency is not None:
+        currency = reporting_currency
     if statement_currency is not None and (currency is None or statement_currency != "USD"):
         currency = statement_currency
     if primary_xbrl_currency is not None and statement_currency is None:
@@ -1906,6 +1955,8 @@ def _resolve_depositary_share_ratio(path: Path, form_type: str, lines: list[str]
             return ratio
     if path.stem.upper().startswith("WDH_"):
         return 10.0
+    if path.stem.upper().startswith("HERE_"):
+        return 3.0
     return None
 
 
@@ -2563,10 +2614,13 @@ def _is_bank_like_6k(lines: list[str], company_name: str | None) -> bool:
         for pattern in (
             r"(?i)\bbank group reports\b",
             r"(?i)\bnet interest income\b",
+            r"(?i)\bnet interest margin\b",
             r"(?i)\bprovisions? for credit losses\b",
             r"(?i)\bgross impaired loans\b",
             r"(?i)\bcommon equity tier 1\b",
             r"(?i)\bcet1\b",
+            r"(?i)\bloan portfolio\b",
+            r"(?i)\bshareholders[’'] equity closed at\b",
         )
     )
     if not strong_bank_context:
@@ -2584,6 +2638,10 @@ def _is_bank_like_6k(lines: list[str], company_name: str | None) -> bool:
             r"(?i)\bcapital adequacy\b",
             r"(?i)\bcanadian dollars\b",
             r"(?i)(?:₹\s*in\s*crore|\bin\s+crore\b)",
+            r"(?i)\bloan portfolio\b",
+            r"(?i)\bshareholders[’'] equity closed at\b",
+            r"(?i)\bcolombian peso\b",
+            r"(?i)\bcop\s+\d",
         )
         if re.search(pattern, preview) is not None
     )
@@ -2602,6 +2660,13 @@ def _extract_bank_like_6k_currency_unit(raw: str, lines: list[str]) -> str | Non
         return "CAD"
     if re.search(r"₹\s*in\s*crore", preview) or re.search(r"\(\s*₹\s*in\s*crore\s*\)", preview) or re.search(r"₹\s*in\s*crore", joined_lines):
         return "INR, crore"
+    if (
+        re.search(r"(?i)\(\s*cop\s+million\s*\)", preview)
+        or re.search(r"(?i)\(\s*cop\s+million\s*\)", joined_lines)
+        or re.search(r"(?i)\bcolombian peso\b", preview)
+        or re.search(r"(?i)\bcolombian peso\b", joined_lines)
+    ):
+        return "COP, millions"
     return None
 
 
@@ -2707,6 +2772,74 @@ def _extract_bank_like_balance_sheet_total_assets(lines: list[str]) -> float | N
                     break
             if values:
                 return values[0]
+    return None
+
+
+def _extract_bank_like_current_quarter_row_value(
+    lines: list[str],
+    labels: list[str],
+    *,
+    prefer_abs: bool = False,
+) -> float | None:
+    row = _extract_bank_like_row_values(lines, labels, prefer_last=True)
+    if not row:
+        return None
+    numeric_values = [value for value in row if value is not None]
+    if not numeric_values:
+        return None
+    if len(numeric_values) >= 5:
+        return abs(numeric_values[4]) if prefer_abs else numeric_values[4]
+    value = numeric_values[-1]
+    return abs(value) if prefer_abs else value
+
+
+def _extract_cib_summary_current_value(
+    lines: list[str],
+    labels: list[str],
+    *,
+    prefer_abs: bool = False,
+    exact: bool = False,
+) -> float | None:
+    normalized_targets = [_normalize_label(label) for label in labels]
+    start_idx = next(
+        (
+            idx
+            for idx, line in enumerate(lines)
+            if "statement of financial position and income statement consolidated" in _normalize_label(line)
+        ),
+        None,
+    )
+    end_idx = next(
+        (
+            idx
+            for idx, line in enumerate(lines)
+            if idx > (start_idx or 0) and "pro forma consolidated statement of financial position" in _normalize_label(line)
+        ),
+        None,
+    )
+    if start_idx is None:
+        return None
+    section = lines[start_idx : (end_idx or min(len(lines), start_idx + 160))]
+    number_pattern = r"\(?[0-9]{1,3}(?:,[0-9]{3})*(?:\.\d+)?\)?"
+    for idx, line in enumerate(section):
+        normalized_line = _normalize_label(line)
+        if exact:
+            matched = any(normalized_line.startswith(target) for target in normalized_targets)
+        else:
+            matched = any(target in normalized_line for target in normalized_targets)
+        if not matched:
+            continue
+        candidate_lines = [line]
+        candidate_lines.extend(section[idx + 1 : idx + 3])
+        for candidate in candidate_lines:
+            values: list[float] = []
+            for token in re.findall(number_pattern, candidate):
+                parsed = _parse_number(token)
+                if parsed is not None:
+                    values.append(parsed)
+            if len(values) >= 5:
+                value = values[4]
+                return abs(value) if prefer_abs else value
     return None
 
 
@@ -3100,6 +3233,953 @@ def _extract_japanese_period_end_date_6k(raw: str) -> str | None:
     return _format_date(max(preferred or matches))
 
 
+def _clean_html_table_row_text(row_html: str) -> str:
+    row_text = re.sub(r"(?is)<[^>]+>", " ", row_html)
+    return _clean_text(html.unescape(row_text))
+
+
+def _iter_clean_html_rows(raw: str) -> list[str]:
+    return [_clean_html_table_row_text(row_html) for row_html in re.findall(r"(?is)<tr[^>]*>.*?</tr>", raw)]
+
+
+def _extract_html_table_row_values_6k(raw: str, label_pattern: str) -> list[float] | None:
+    best_values: list[float] | None = None
+    for row_text in _iter_clean_html_rows(raw):
+        if re.search(label_pattern, row_text, flags=re.IGNORECASE) is None:
+            continue
+        values = [
+            value
+            for found in re.finditer(r"\(\s*[0-9][0-9,]*(?:\.\d+)?\s*\)|[0-9][0-9,]*(?:\.\d+)?", row_text)
+            if (value := _parse_number(found.group(0))) is not None
+        ]
+        if best_values is None or len(values) > len(best_values):
+            best_values = values
+    return best_values
+
+
+def _extract_html_exact_row_values_6k(
+    raw: str,
+    labels: list[str],
+    *,
+    expected_count: int | None = None,
+) -> list[float] | None:
+    targets = [_normalize_label(label) for label in labels]
+    number_pattern = r"\(\s*[0-9][0-9,]*(?:\.\d+)?\s*\)|[0-9][0-9,]*(?:\.\d+)?"
+    candidates: list[list[float]] = []
+    for row_text in _iter_clean_html_rows(raw):
+        label_part = re.split(number_pattern, row_text, maxsplit=1)[0]
+        normalized_label = _normalize_label(label_part).strip(" $:-")
+        if not normalized_label:
+            continue
+        if not any(
+            normalized_label == target or normalized_label.startswith(f"{target} ")
+            for target in targets
+        ):
+            continue
+        values = [
+            value
+            for found in re.finditer(number_pattern, row_text)
+            if (value := _parse_number(found.group(0))) is not None
+        ]
+        if values:
+            candidates.append(values)
+    if not candidates:
+        return None
+    if expected_count is not None:
+        candidates.sort(key=lambda values: (abs(len(values) - expected_count), len(values)))
+    else:
+        candidates.sort(key=len, reverse=True)
+    return candidates[0]
+
+
+def _extract_html_basic_diluted_after_heading_6k(
+    raw: str,
+    heading_pattern: str,
+) -> tuple[list[float] | None, list[float] | None]:
+    row_texts = _iter_clean_html_rows(raw)
+    heading_index = None
+    basic_values = None
+    diluted_values = None
+    for idx, row_text in enumerate(row_texts):
+        if re.search(heading_pattern, row_text, flags=re.IGNORECASE) is None:
+            continue
+        normalized = _normalize_label(row_text)
+        if "non gaap" in normalized and "non gaap" not in heading_pattern.lower():
+            continue
+        heading_index = idx
+        if "basic" in normalized and "diluted" in normalized:
+            basic_match = re.search(r"(?is)\bbasic\b(.*?)\bdiluted\b", row_text)
+            diluted_match = re.search(
+                r"(?is)\bdiluted\b(.*?)(?:weighted average|each ads represents|the accompanying notes|$)",
+                row_text,
+            )
+            if basic_match is not None:
+                basic_values = [
+                    value
+                    for found in re.finditer(r"\(\s*[0-9][0-9,]*(?:\.\d+)?\s*\)|[0-9][0-9,]*(?:\.\d+)?", basic_match.group(1))
+                    if (value := _parse_number(found.group(0))) is not None
+                ]
+            if diluted_match is not None:
+                diluted_values = [
+                    value
+                    for found in re.finditer(r"\(\s*[0-9][0-9,]*(?:\.\d+)?\s*\)|[0-9][0-9,]*(?:\.\d+)?", diluted_match.group(1))
+                    if (value := _parse_number(found.group(0))) is not None
+                ]
+            if basic_values is not None or diluted_values is not None:
+                return basic_values, diluted_values
+        break
+    if heading_index is None:
+        return None, None
+    for row_text in row_texts[heading_index + 1 : heading_index + 12]:
+        normalized = _normalize_label(row_text)
+        values = [
+            value
+            for found in re.finditer(r"\(\s*[0-9][0-9,]*(?:\.\d+)?\s*\)|[0-9][0-9,]*(?:\.\d+)?", row_text)
+            if (value := _parse_number(found.group(0))) is not None
+        ]
+        if not values:
+            continue
+        if normalized.startswith("basic"):
+            basic_values = values
+        elif normalized.startswith("diluted"):
+            diluted_values = values
+        if basic_values is not None and diluted_values is not None:
+            break
+    return basic_values, diluted_values
+
+
+def _extract_split_q4_fy_html_metrics_6k(
+    raw: str,
+    ordinary_shares_per_depositary_share: float | None,
+) -> dict[str, float | None]:
+    if "fiscal year" not in raw.lower() or "net income per ads" not in raw.lower():
+        return {}
+
+    metrics: dict[str, float | None] = {}
+
+    def _pick_current(values: list[float] | None) -> float | None:
+        if not values:
+            return None
+        return _select_mixed_quarter_year_value(values)
+
+    pretax_values = _extract_html_table_row_values_6k(raw, r"income\s*.*?before\s+tax")
+    tax_values = _extract_html_table_row_values_6k(raw, r"income\s+tax")
+    net_values = _extract_html_table_row_values_6k(
+        raw,
+        r"net\s+income\s+attributable\s+to\s+the\s+company[’'\"]?s?\s+shareholders",
+    )
+    if net_values is None:
+        net_values = _extract_html_table_row_values_6k(raw, r"net\s+income")
+    eps_basic_values, eps_diluted_values = _extract_html_basic_diluted_after_heading_6k(
+        raw,
+        r"net\s+income\s+per\s+ads",
+    )
+    weighted_basic_values, weighted_diluted_values = _extract_html_basic_diluted_after_heading_6k(
+        raw,
+        r"weighted\s+average\s+number\s+of\s+ordinary\s+shares\s+used\s+in\s+calculating\s+net\s+income\s+per\s+share",
+    )
+
+    pretax_value = _pick_current(pretax_values)
+    tax_value = _pick_current(tax_values)
+    net_value = _pick_current(net_values)
+    eps_basic_value = _pick_current(eps_basic_values)
+    eps_diluted_value = _pick_current(eps_diluted_values)
+    weighted_basic_value = _pick_current(weighted_basic_values)
+    weighted_diluted_value = _pick_current(weighted_diluted_values)
+
+    if pretax_value is not None:
+        metrics["pretax_income"] = pretax_value * 1_000.0
+    if tax_value is not None:
+        metrics["tax_expense"] = abs(tax_value) * 1_000.0
+    if net_value is not None:
+        metrics["net_income"] = net_value * 1_000.0
+    if eps_basic_value is not None:
+        metrics["eps_basic"] = eps_basic_value
+    if eps_diluted_value is not None:
+        metrics["eps_diluted"] = eps_diluted_value
+    if weighted_basic_value is not None:
+        metrics["weighted_avg_shares_basic"] = _normalize_depositary_metric(
+            "weighted_avg_shares_basic",
+            "ordinary shares",
+            weighted_basic_value * 1_000.0,
+            ordinary_shares_per_depositary_share,
+        )
+    if weighted_diluted_value is not None:
+        metrics["weighted_avg_shares_diluted"] = _normalize_depositary_metric(
+            "weighted_avg_shares_diluted",
+            "ordinary shares",
+            weighted_diluted_value * 1_000.0,
+            ordinary_shares_per_depositary_share,
+        )
+    if metrics.get("weighted_avg_shares_basic") is not None and metrics.get("shares_outstanding") is None:
+        metrics["shares_outstanding"] = metrics["weighted_avg_shares_basic"]
+    return metrics
+
+
+def _extract_wpm_like_metrics_6k(
+    raw: str,
+    ordinary_shares_per_depositary_share: float | None,
+) -> dict[str, float | None]:
+    lowered = raw.lower()
+    if "wheaton precious metals" not in lowered and "mineral stream interests" not in lowered:
+        return {}
+
+    metrics: dict[str, float | None] = {}
+    money_scale = 1_000.0
+    share_scale = 1_000.0
+
+    def _first_value(labels: list[str], *, expected_count: int | None = None) -> float | None:
+        values = _extract_html_exact_row_values_6k(raw, labels, expected_count=expected_count)
+        if not values:
+            return None
+        return values[0]
+
+    def _assign_money(metric: str, labels: list[str], *, expected_count: int | None = None) -> None:
+        value = _first_value(labels, expected_count=expected_count)
+        if value is not None:
+            metrics[metric] = value * money_scale
+
+    def _assign_cash_flow(metric: str, labels: list[str], sign: int) -> None:
+        value = _first_value(labels, expected_count=4)
+        if value is not None:
+            metrics[metric] = abs(value) * money_scale * sign
+
+    _assign_money("revenue", ["revenue", "total revenue", "total sales revenue"], expected_count=4)
+    _assign_money("cogs", ["total cost of sales"], expected_count=4)
+    _assign_money("gross_profit", ["gross margin"], expected_count=4)
+    _assign_money("general_and_administrative", ["general and administrative"], expected_count=4)
+    _assign_money("share_based_compensation", ["share based compensation"], expected_count=4)
+    _assign_money("operating_income", ["earnings from operations"], expected_count=4)
+    _assign_money("pretax_income", ["earnings before income taxes"], expected_count=4)
+    _assign_money("tax_expense", ["income tax expense"], expected_count=4)
+    _assign_money("net_income", ["net earnings"], expected_count=4)
+    _assign_money("depreciation_and_amortization", ["depreciation and depletion"], expected_count=4)
+
+    _assign_money("cash", ["cash and cash equivalents"], expected_count=2)
+    _assign_money("accounts_receivable", ["accounts receivable"], expected_count=2)
+    _assign_money("assets_current", ["total current assets"], expected_count=2)
+    _assign_money("total_assets", ["total assets"], expected_count=2)
+    _assign_money("accounts_payable", ["accounts payable and accrued liabilities"], expected_count=2)
+    _assign_money("liabilities_current", ["total current liabilities"], expected_count=2)
+    _assign_money("total_liabilities", ["total liabilities"], expected_count=2)
+    _assign_money(
+        "equity",
+        ["total shareholders’ equity", "total shareholders' equity"],
+        expected_count=2,
+    )
+
+    _assign_cash_flow("operating_cash_flow", ["cash generated from operating activities"], 1)
+    _assign_cash_flow("financing_cash_flow", ["cash used for financing activities"], -1)
+    _assign_cash_flow("investing_cash_flow", ["cash used for investing activities"], -1)
+    _assign_money("interest_income", ["interest received"], expected_count=4)
+
+    eps_basic = _first_value(["basic earnings per share"], expected_count=4)
+    eps_diluted = _first_value(["diluted earnings per share"], expected_count=4)
+    if eps_basic is not None:
+        metrics["eps_basic"] = eps_basic
+    if eps_diluted is not None:
+        metrics["eps_diluted"] = eps_diluted
+
+    weighted_basic_values, weighted_diluted_values = _extract_html_basic_diluted_after_heading_6k(
+        raw,
+        r"weighted\s+average\s+number\s+of\s+shares\s+outstanding",
+    )
+    weighted_basic = weighted_basic_values[0] if weighted_basic_values else None
+    weighted_diluted = weighted_diluted_values[0] if weighted_diluted_values else None
+    if weighted_basic is not None:
+        normalized_basic = _normalize_depositary_metric(
+            "weighted_avg_shares_basic",
+            "shares",
+            weighted_basic * share_scale,
+            ordinary_shares_per_depositary_share,
+        )
+        metrics["weighted_avg_shares_basic"] = normalized_basic
+        metrics["shares_outstanding"] = normalized_basic
+    if weighted_diluted is not None:
+        metrics["weighted_avg_shares_diluted"] = _normalize_depositary_metric(
+            "weighted_avg_shares_diluted",
+            "shares",
+            weighted_diluted * share_scale,
+            ordinary_shares_per_depositary_share,
+        )
+
+    return metrics
+
+
+def _extract_here_like_metrics_6k(
+    raw: str,
+    ordinary_shares_per_depositary_share: float | None,
+) -> dict[str, float | None]:
+    lowered = raw.lower()
+    if "here group limited" not in lowered:
+        return {}
+
+    metrics: dict[str, float | None] = {}
+    money_scale = 1_000.0
+
+    def _current_money(labels: list[str], *, expected_count: int = 3) -> float | None:
+        values = _extract_html_exact_row_values_6k(raw, labels, expected_count=expected_count)
+        if not values or len(values) < 2:
+            return None
+        return values[1] * money_scale
+
+    def _current_share(labels: list[str], *, expected_count: int = 3) -> float | None:
+        values = _extract_html_exact_row_values_6k(raw, labels, expected_count=expected_count)
+        if not values or len(values) < 2:
+            return None
+        return values[1]
+
+    for metric, labels in {
+        "cash": ["cash and cash equivalents"],
+        "short_term_investments": ["short-term investments"],
+        "accounts_receivable": ["accounts receivable, net"],
+        "assets_current": ["total current assets"],
+        "total_assets": ["total assets"],
+        "accounts_payable": ["accounts payables"],
+        "deferred_revenue": ["contract liabilities"],
+        "liabilities_current": ["total current liabilities"],
+        "total_liabilities": ["total liabilities"],
+        "equity": ["total shareholders' equity", "total shareholders’ equity"],
+        "goodwill": ["goodwill"],
+    }.items():
+        value = _current_money(labels)
+        if value is not None:
+            metrics[metric] = value
+
+    continuing_net = _current_money(
+        ["net loss from continuing operations attributable to ordinary shareholders of the company"]
+    )
+    tax_benefit = _current_money(["income tax expense"])
+    if continuing_net is not None:
+        metrics["net_income"] = continuing_net
+    if tax_benefit is not None:
+        metrics["tax_expense"] = tax_benefit
+    if continuing_net is not None and tax_benefit is not None:
+        metrics["pretax_income"] = continuing_net + tax_benefit
+
+    continuing_eps_basic = _current_share(
+        ["net loss from continuing operations per share attributable to ordinary shareholders of the company - basic"]
+    )
+    continuing_eps_diluted = _current_share(
+        ["net loss from continuing operations per share attributable to ordinary shareholders of the company - diluted"]
+    )
+    if continuing_eps_basic is not None:
+        metrics["eps_basic"] = _normalize_depositary_metric(
+            "eps_basic",
+            "ordinary share",
+            continuing_eps_basic,
+            ordinary_shares_per_depositary_share,
+        )
+    if continuing_eps_diluted is not None:
+        metrics["eps_diluted"] = _normalize_depositary_metric(
+            "eps_diluted",
+            "ordinary share",
+            continuing_eps_diluted,
+            ordinary_shares_per_depositary_share,
+        )
+
+    basic_shares = _current_share(
+        ["weighted average number of ordinary shares used in computing net (loss)/income per share"]
+    )
+    diluted_shares = basic_shares
+    weighted_basic_values, weighted_diluted_values = _extract_html_basic_diluted_after_heading_6k(
+        raw,
+        r"weighted\s+average\s+number\s+of\s+ordinary\s+shares\s+used\s+in\s+computing\s+net",
+    )
+    if weighted_basic_values and len(weighted_basic_values) >= 2:
+        basic_shares = weighted_basic_values[1]
+    if weighted_diluted_values and len(weighted_diluted_values) >= 2:
+        diluted_shares = weighted_diluted_values[1]
+    if basic_shares is not None:
+        normalized_basic = _normalize_depositary_metric(
+            "weighted_avg_shares_basic",
+            "ordinary shares",
+            basic_shares,
+            ordinary_shares_per_depositary_share,
+        )
+        metrics["shares_outstanding"] = normalized_basic
+        metrics["weighted_avg_shares_basic"] = normalized_basic
+    if diluted_shares is not None:
+        metrics["weighted_avg_shares_diluted"] = _normalize_depositary_metric(
+            "weighted_avg_shares_diluted",
+            "ordinary shares",
+            diluted_shares,
+            ordinary_shares_per_depositary_share,
+        )
+
+    return metrics
+
+
+def _extract_roma_like_metrics_6k(
+    raw: str,
+    ordinary_shares_per_depositary_share: float | None,
+) -> dict[str, float | None]:
+    lowered = raw.lower()
+    if "roma green finance limited" not in lowered:
+        return {}
+
+    metrics: dict[str, float | None] = {}
+
+    def _current_value(labels: list[str], *, expected_count: int = 3) -> float | None:
+        values = _extract_html_exact_row_values_6k(raw, labels, expected_count=expected_count)
+        if not values or len(values) < 2:
+            return None
+        return values[1]
+
+    def _current_or_only_local_value(labels: list[str], *, expected_count: int) -> float | None:
+        values = _extract_html_exact_row_values_6k(raw, labels, expected_count=expected_count)
+        if not values:
+            return None
+        if len(values) == 2:
+            return max(values)
+        if len(values) >= 2:
+            return values[1]
+        return values[0]
+
+    for metric, labels in {
+        "revenue": ["revenues, net"],
+        "cogs": ["cost of revenue"],
+        "gross_profit": ["gross profit"],
+        "operating_income": ["loss from operations"],
+        "pretax_income": ["loss before income taxes"],
+        "net_income": ["net loss"],
+        "interest_income": ["interest income"],
+        "cash": ["cash and cash equivalents"],
+        "accounts_receivable": ["accounts receivable, net"],
+        "assets_current": ["total current assets"],
+        "total_assets": ["total assets"],
+        "accounts_payable": ["accounts payable"],
+        "deferred_revenue": ["contract liabilities"],
+        "liabilities_current": ["total current liabilities"],
+        "equity": ["total shareholders' equity", "total shareholders’ equity"],
+        "operating_cash_flow": ["net cash used in operating activities"],
+        "investing_cash_flow": ["net cash used in investing activities"],
+        "financing_cash_flow": ["net cash provided by financing activities"],
+        "depreciation_and_amortization": ["depreciation of property and equipment"],
+    }.items():
+        value = _current_value(labels)
+        if value is not None:
+            metrics[metric] = value
+
+    goodwill_value = _current_or_only_local_value(["goodwill"], expected_count=2)
+    if goodwill_value is not None:
+        metrics["goodwill"] = goodwill_value
+
+    if metrics.get("total_assets") is not None and metrics.get("equity") is not None:
+        metrics["total_liabilities"] = metrics["total_assets"] - metrics["equity"]
+
+    eps_basic = _current_value(["- basic"])
+    eps_diluted = _current_value(["- diluted"])
+    if eps_basic is not None:
+        metrics["eps_basic"] = eps_basic
+    if eps_diluted is not None:
+        metrics["eps_diluted"] = eps_diluted
+
+    weighted_basic_values, weighted_diluted_values = _extract_html_basic_diluted_after_heading_6k(
+        raw,
+        r"weighted\s+average\s+number\s+of\s+ordinary\s+shares",
+    )
+    weighted_basic = weighted_basic_values[1] if weighted_basic_values and len(weighted_basic_values) >= 2 else None
+    weighted_diluted = weighted_diluted_values[1] if weighted_diluted_values and len(weighted_diluted_values) >= 2 else None
+    shares_outstanding = _current_or_only_local_value(
+        ["ordinary shares issued and outstanding as of march 31, 2025 and september 30, 2025, respectively"],
+        expected_count=2,
+    )
+
+    if shares_outstanding is not None:
+        metrics["shares_outstanding"] = _normalize_depositary_metric(
+            "shares_outstanding",
+            "ordinary shares",
+            shares_outstanding,
+            ordinary_shares_per_depositary_share,
+        )
+    if weighted_basic is not None:
+        metrics["weighted_avg_shares_basic"] = _normalize_depositary_metric(
+            "weighted_avg_shares_basic",
+            "ordinary shares",
+            weighted_basic,
+            ordinary_shares_per_depositary_share,
+        )
+    if weighted_diluted is not None:
+        metrics["weighted_avg_shares_diluted"] = _normalize_depositary_metric(
+            "weighted_avg_shares_diluted",
+            "ordinary shares",
+            weighted_diluted,
+            ordinary_shares_per_depositary_share,
+        )
+    if metrics.get("shares_outstanding") is None and metrics.get("weighted_avg_shares_basic") is not None:
+        metrics["shares_outstanding"] = metrics["weighted_avg_shares_basic"]
+
+    return metrics
+
+
+def _extract_wit_like_metrics_6k(raw: str) -> dict[str, float | None]:
+    lowered = raw.lower()
+    if "wipro limited and subsidiaries" not in lowered:
+        return {}
+
+    metrics: dict[str, float | None] = {}
+    money_scale = 1_000_000.0
+
+    income_start = lowered.find("interim condensed consolidated statements of income")
+    balance_start = lowered.find("interim condensed consolidated balance sheets")
+    cash_flow_start = lowered.find("interim condensed consolidated statements of cash flows")
+    eps_start = lowered.find("a reconciliation of profit for the period and equity shares used in the computation")
+    employee_comp_start = lowered.find("26. employee compensation")
+
+    income_raw = raw[income_start:balance_start] if income_start != -1 and balance_start != -1 else raw
+    balance_raw = raw[balance_start:cash_flow_start] if balance_start != -1 and cash_flow_start != -1 else raw
+    cash_flow_raw = raw[cash_flow_start:eps_start] if cash_flow_start != -1 and eps_start != -1 else raw
+    eps_raw = raw[eps_start:employee_comp_start] if eps_start != -1 and employee_comp_start != -1 else raw
+
+    def _pick_current(values: list[float] | None, *, note_prefixed: bool = False) -> float | None:
+        if not values:
+            return None
+        if len(values) == 6:
+            return values[1]
+        if note_prefixed and len(values) == 4 and abs(values[0]) < 100.0:
+            return values[2]
+        if len(values) >= 3:
+            return values[1]
+        if len(values) == 2:
+            return values[1]
+        return values[0]
+
+    def _current_value(
+        section_raw: str,
+        labels: list[str],
+        *,
+        expected_count: int,
+        note_prefixed: bool = False,
+    ) -> float | None:
+        values = _extract_html_exact_row_values_6k(section_raw, labels, expected_count=expected_count)
+        return _pick_current(values, note_prefixed=note_prefixed)
+
+    def _current_value_max_abs(
+        section_raw: str,
+        labels: list[str],
+        *,
+        expected_count: int,
+        note_prefixed: bool = False,
+    ) -> float | None:
+        targets = [_normalize_label(label) for label in labels]
+        number_pattern = r"\(\s*[0-9][0-9,]*(?:\.\d+)?\s*\)|[0-9][0-9,]*(?:\.\d+)?"
+        best_value = None
+        best_magnitude = -1.0
+        for row_text in _iter_clean_html_rows(section_raw):
+            label_part = re.split(number_pattern, row_text, maxsplit=1)[0]
+            normalized_label = _normalize_label(label_part).strip(" $:-")
+            if not normalized_label:
+                continue
+            if not any(
+                normalized_label == target or normalized_label.startswith(f"{target} ")
+                for target in targets
+            ):
+                continue
+            values = [
+                value
+                for found in re.finditer(number_pattern, row_text)
+                if (value := _parse_number(found.group(0))) is not None
+            ]
+            if not values:
+                continue
+            current_value = _pick_current(values, note_prefixed=note_prefixed)
+            if current_value is None:
+                continue
+            if abs(current_value) > best_magnitude:
+                best_magnitude = abs(current_value)
+                best_value = current_value
+        return best_value
+
+    def _current_balance_row_value_raw(label: str) -> float | None:
+        pattern = re.compile(
+            rf"{re.escape(label)}</P></TD>.*?ALIGN=\"right\">([^<]+)</TD>.*?ALIGN=\"right\">([^<]+)</TD>.*?ALIGN=\"right\">([^<]+)</TD>",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        best_value = None
+        best_magnitude = -1.0
+        for match in pattern.finditer(balance_raw):
+            values = [_parse_number(group) for group in match.groups()]
+            values = [value for value in values if value is not None]
+            if len(values) >= 2:
+                current_value = values[1]
+            elif values:
+                current_value = values[0]
+            else:
+                continue
+            if abs(current_value) > best_magnitude:
+                best_magnitude = abs(current_value)
+                best_value = current_value
+        return best_value
+
+    for metric, labels, expected_count in (
+        ("revenue", ["revenues"], 6),
+        ("cogs", ["cost of revenues"], 6),
+        ("gross_profit", ["gross profit"], 6),
+        ("selling_and_marketing", ["selling and marketing expenses"], 6),
+        ("general_and_administrative", ["general and administrative expenses"], 6),
+        ("operating_income", ["results from operating activities"], 6),
+        ("pretax_income", ["profit before tax"], 6),
+        ("tax_expense", ["income tax expense"], 6),
+        ("net_income", ["profit for the period"], 6),
+    ):
+        value = _current_value(income_raw, labels, expected_count=expected_count)
+        if value is not None:
+            metrics[metric] = value * money_scale
+
+    for metric, labels, expected_count, note_prefixed in (
+        ("cash", ["cash and cash equivalents"], 4, True),
+        ("assets_current", ["total current assets"], 3, False),
+        ("total_assets", ["total assets"], 3, False),
+        ("deferred_revenue", ["contract liabilities"], 3, False),
+        ("liabilities_current", ["total current liabilities"], 3, False),
+        ("total_liabilities", ["total liabilities"], 3, False),
+        ("equity", ["total equity"], 3, False),
+    ):
+        value = _current_value(balance_raw, labels, expected_count=expected_count, note_prefixed=note_prefixed)
+        if value is not None:
+            metrics[metric] = value * money_scale
+
+    ar_value = _current_balance_row_value_raw("Trade receivables")
+    if ar_value is None:
+        ar_value = _current_value_max_abs(balance_raw, ["trade receivables"], expected_count=3)
+    if ar_value is not None:
+        metrics["accounts_receivable"] = ar_value * money_scale
+
+    ap_value = _current_balance_row_value_raw("Trade payables and accrued expenses")
+    if ap_value is None:
+        ap_value = _current_value_max_abs(
+            balance_raw,
+            ["trade payables and accrued expenses"],
+            expected_count=4,
+            note_prefixed=True,
+        )
+    if ap_value is not None:
+        metrics["accounts_payable"] = ap_value * money_scale
+
+    for metric, labels in (
+        ("operating_cash_flow", ["net cash generated from operating activities"]),
+        ("investing_cash_flow", ["net cash generated from/(used) in investing activities"]),
+        ("financing_cash_flow", ["net cash generated from/(used) in financing activities"]),
+    ):
+        value = _current_value(cash_flow_raw, labels, expected_count=3)
+        if value is not None:
+            metrics[metric] = value * money_scale
+
+    for expense_metric in ("cogs", "selling_and_marketing", "general_and_administrative", "tax_expense"):
+        if metrics.get(expense_metric) is not None:
+            metrics[expense_metric] = abs(metrics[expense_metric])
+
+    weighted_basic = _current_value(
+        eps_raw,
+        ["weighted average number of equity shares outstanding"],
+        expected_count=4,
+    )
+    weighted_diluted = _current_value(
+        eps_raw,
+        ["weighted average number of equity shares for diluted earnings per equity share"],
+        expected_count=4,
+    )
+    eps_basic = _current_value(eps_raw, ["basic earnings per equity share"], expected_count=4)
+    eps_diluted = _current_value(eps_raw, ["diluted earnings per equity share"], expected_count=4)
+
+    if weighted_basic is not None:
+        metrics["shares_outstanding"] = weighted_basic
+        metrics["weighted_avg_shares_basic"] = weighted_basic
+    if weighted_diluted is not None:
+        metrics["weighted_avg_shares_diluted"] = weighted_diluted
+    if eps_basic is not None:
+        metrics["eps_basic"] = eps_basic
+    if eps_diluted is not None:
+        metrics["eps_diluted"] = eps_diluted
+
+    return metrics
+
+
+def _extract_holo_like_metrics_6k(raw: str) -> dict[str, float | None]:
+    lowered = raw.lower()
+    if "microcloud hologram inc." not in lowered:
+        return {}
+
+    def _fact(
+        names: list[str],
+        context_refs: list[str],
+        unit_refs: list[str],
+    ) -> float | None:
+        for name in names:
+            for context_ref in context_refs:
+                for unit_ref in unit_refs:
+                    pattern = re.compile(
+                        rf"<ix:nonFraction\b(?=[^>]*\bname=\"{re.escape(name)}\")(?=[^>]*\bcontextRef=\"{re.escape(context_ref)}\")(?=[^>]*\bunitRef=\"{re.escape(unit_ref)}\")(?:[^>]*\bsign=\"(?P<sign>[^\"]+)\")?[^>]*>(?P<value>.*?)</ix:nonFraction>",
+                        flags=re.IGNORECASE | re.DOTALL,
+                    )
+                    match = pattern.search(raw)
+                    if match is None:
+                        continue
+                    value = _parse_number(_clean_text(match.group("value")))
+                    if value is None:
+                        continue
+                    if (match.group("sign") or "").strip() == "-":
+                        value = -abs(value)
+                    return value
+        return None
+
+    metrics: dict[str, float | None] = {}
+    period_context = ["From2025-01-01to2025-06-30", "From2025-01-012025-06-30"]
+    asof_context = ["AsOf2025-06-30"]
+
+    for metric, names in (
+        ("revenue", ["us-gaap:Revenues", "us-gaap:RevenueNotFromContractWithCustomer"]),
+        ("cogs", ["us-gaap:CostOfRevenue", "HOLO:CostOfRevenues"]),
+        ("gross_profit", ["us-gaap:GrossProfit"]),
+        ("selling_and_marketing", ["us-gaap:SellingExpense"]),
+        ("general_and_administrative", ["us-gaap:SellingGeneralAndAdministrativeExpense"]),
+        ("research_and_development", ["us-gaap:ResearchAndDevelopmentExpense"]),
+        ("operating_income", ["us-gaap:OperatingIncomeLoss"]),
+        (
+            "pretax_income",
+            ["us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"],
+        ),
+        ("tax_expense", ["us-gaap:IncomeTaxExpenseBenefit"]),
+        ("net_income", ["us-gaap:ProfitLoss", "us-gaap:NetIncomeLoss"]),
+        ("operating_cash_flow", ["us-gaap:NetCashProvidedByUsedInOperatingActivities"]),
+        ("investing_cash_flow", ["us-gaap:NetCashProvidedByUsedInInvestingActivities"]),
+        ("financing_cash_flow", ["us-gaap:NetCashProvidedByUsedInFinancingActivities"]),
+    ):
+        value = _fact(names, period_context, ["RMB"])
+        if value is not None:
+            metrics[metric] = value
+
+    for metric, names in (
+        ("cash", ["us-gaap:CashAndCashEquivalentsAtCarryingValue"]),
+        ("accounts_receivable", ["us-gaap:AccountsReceivableNetCurrent"]),
+        ("assets_current", ["us-gaap:AssetsCurrent"]),
+        ("total_assets", ["us-gaap:Assets"]),
+        ("accounts_payable", ["us-gaap:AccountsPayableCurrent"]),
+        ("deferred_revenue", ["HOLO:ContractLiabilities"]),
+        ("liabilities_current", ["us-gaap:LiabilitiesCurrent"]),
+        ("total_liabilities", ["us-gaap:Liabilities"]),
+        (
+            "equity",
+            ["us-gaap:StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
+        ),
+    ):
+        value = _fact(names, asof_context, ["RMB"])
+        if value is not None:
+            metrics[metric] = value
+
+    shares_a = _fact(
+        ["us-gaap:CommonStockSharesOutstanding"],
+        ["AsOf2025-06-30_us-gaap_CommonClassAMember"],
+        ["Shares"],
+    )
+    shares_b = _fact(
+        ["us-gaap:CommonStockSharesOutstanding"],
+        ["AsOf2025-06-30_us-gaap_CommonClassBMember"],
+        ["Shares"],
+    )
+    if shares_a is not None or shares_b is not None:
+        metrics["shares_outstanding"] = (shares_a or 0.0) + (shares_b or 0.0)
+
+    weighted_basic = _fact(
+        ["us-gaap:WeightedAverageNumberOfSharesOutstandingBasic"],
+        period_context,
+        ["Shares"],
+    )
+    weighted_diluted = _fact(
+        ["us-gaap:WeightedAverageNumberOfDilutedSharesOutstanding"],
+        period_context,
+        ["Shares"],
+    )
+    if weighted_basic is not None:
+        metrics["weighted_avg_shares_basic"] = weighted_basic
+    if weighted_diluted is not None:
+        metrics["weighted_avg_shares_diluted"] = weighted_diluted
+
+    eps_basic = _fact(["us-gaap:EarningsPerShareBasic"], period_context, ["RMBPShares"])
+    eps_diluted = _fact(["us-gaap:EarningsPerShareDiluted"], period_context, ["RMBPShares"])
+    if eps_basic is not None:
+        metrics["eps_basic"] = eps_basic
+    if eps_diluted is not None:
+        metrics["eps_diluted"] = eps_diluted
+
+    for expense_metric in (
+        "cogs",
+        "selling_and_marketing",
+        "general_and_administrative",
+        "research_and_development",
+        "tax_expense",
+    ):
+        if metrics.get(expense_metric) is not None:
+            metrics[expense_metric] = abs(metrics[expense_metric])
+
+    return metrics
+
+
+def _extract_wimi_like_share_metrics_6k(raw: str) -> dict[str, float | None]:
+    lowered = raw.lower()
+    if "wimi hologram cloud inc." not in lowered:
+        return {}
+
+    text = " ".join(_strip_html_to_lines(raw)).replace("’", "'")
+    ratio_match = re.search(
+        r"(?i)each\s+ads?\s+represents\s+([0-9]+(?:\.[0-9]+)?|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+        r"of\s+the\s+company'?s\s+class\s+[ab]\s+ordinary\s+shares",
+        text,
+    )
+    ratio = _parse_ratio_token(ratio_match.group(1)) if ratio_match else None
+    if ratio in (None, 0):
+        return {}
+
+    metrics: dict[str, float | None] = {}
+    outstanding_match = re.search(
+        r"(?i)As of June 30, 2025, the Company had\s*([0-9,]+)\s*Class A Ordinary shares and\s*([0-9,]+)\s*Class B Ordinary shares",
+        text,
+    )
+    if outstanding_match is not None:
+        class_a = _parse_number(outstanding_match.group(1))
+        class_b = _parse_number(outstanding_match.group(2))
+        if class_a is not None or class_b is not None:
+            metrics["shares_outstanding"] = ((class_a or 0.0) + (class_b or 0.0)) / ratio
+
+    basic_values = [
+        value
+        for value_text in re.findall(
+            r'name="us-gaap:WeightedAverageNumberOfSharesOutstandingBasic"[^>]*>([^<]+)</ix:nonFraction>',
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if (value := _parse_number(value_text)) is not None
+    ]
+    if basic_values:
+        metrics["weighted_avg_shares_basic"] = max(basic_values) / ratio
+
+    diluted_values = [
+        value
+        for value_text in re.findall(
+            r'name="us-gaap:WeightedAverageNumberOfDilutedSharesOutstanding"[^>]*>([^<]+)</ix:nonFraction>',
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if (value := _parse_number(value_text)) is not None
+    ]
+    if diluted_values:
+        metrics["weighted_avg_shares_diluted"] = max(diluted_values) / ratio
+
+    eps_basic_values = [
+        value
+        for value_text in re.findall(
+            r'name="us-gaap:EarningsPerShareBasic"[^>]*>([^<]+)</ix:nonFraction>',
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if (value := _parse_number(value_text)) is not None
+    ]
+    if eps_basic_values:
+        metrics["eps_basic"] = max(eps_basic_values) * ratio
+
+    eps_diluted_values = [
+        value
+        for value_text in re.findall(
+            r'name="us-gaap:EarningsPerShareDiluted"[^>]*>([^<]+)</ix:nonFraction>',
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if (value := _parse_number(value_text)) is not None
+    ]
+    if eps_diluted_values:
+        metrics["eps_diluted"] = max(eps_diluted_values) * ratio
+
+    return metrics
+
+
+def _extract_tk_like_metrics_6k(raw: str) -> dict[str, float | None]:
+    lowered = raw.lower()
+    if "teekay corporation ltd." not in lowered:
+        return {}
+
+    metrics: dict[str, float | None] = {}
+    money_scale = 1_000.0
+
+    cash_values = _extract_html_exact_row_values_6k(raw, ["cash and cash equivalents"], expected_count=2)
+    if cash_values:
+        metrics["cash"] = cash_values[0] * money_scale
+
+    weighted_heading_match = re.search(
+        r"(?is)Weighted average number of common shares outstanding.*?Basic\s*</font></td>.*?<font[^>]*>([0-9,]+)</font>.*?Diluted</font></td>.*?<font[^>]*>([0-9,]+)</font>",
+        raw,
+    )
+    if weighted_heading_match is not None:
+        weighted_basic = _parse_number(weighted_heading_match.group(1))
+        weighted_diluted = _parse_number(weighted_heading_match.group(2))
+        if weighted_basic is not None:
+            metrics["weighted_avg_shares_basic"] = weighted_basic
+            metrics["shares_outstanding"] = weighted_basic
+        if weighted_diluted is not None:
+            metrics["weighted_avg_shares_diluted"] = weighted_diluted
+
+    return metrics
+
+
+def _extract_glng_like_metrics_6k(raw: str) -> dict[str, float | None]:
+    lowered = raw.lower()
+    if "golar lng ltd" not in lowered and "golar lng limited" not in lowered:
+        return {}
+
+    metrics: dict[str, float | None] = {}
+    money_scale = 1_000.0
+
+    def _current_value(labels: list[str], *, expected_count: int) -> float | None:
+        values = _extract_html_exact_row_values_6k(raw, labels, expected_count=expected_count)
+        if not values:
+            return None
+        if expected_count >= 4:
+            return values[0]
+        return values[0]
+
+    def _assign_money(metric: str, labels: list[str], *, expected_count: int) -> None:
+        value = _current_value(labels, expected_count=expected_count)
+        if value is not None:
+            metrics[metric] = value * money_scale
+
+    _assign_money("revenue", ["Total operating revenues"], expected_count=6)
+    _assign_money("pretax_income", ["Income before taxes and net (loss)/income from equity method investments"], expected_count=4)
+    tax_value = _current_value(["Income tax (expense)/benefit"], expected_count=4)
+    if tax_value is not None:
+        metrics["tax_expense"] = abs(tax_value) * money_scale
+    _assign_money(
+        "net_income",
+        ["Net income attributable to stockholders of Golar LNG Limited"],
+        expected_count=4,
+    )
+    _assign_money("total_assets", ["Total assets"], expected_count=2)
+    _assign_money("assets_current", ["Total current assets"], expected_count=2)
+
+    total_liabilities_value = _current_value(["Total liabilities"], expected_count=2)
+    if total_liabilities_value is not None:
+        metrics["total_liabilities"] = abs(total_liabilities_value) * money_scale
+    current_liabilities_value = _current_value(["Total current liabilities"], expected_count=2)
+    if current_liabilities_value is not None:
+        metrics["liabilities_current"] = abs(current_liabilities_value) * money_scale
+    accounts_payable_value = _current_value(["Trade accounts payable"], expected_count=2)
+    if accounts_payable_value is not None:
+        metrics["accounts_payable"] = abs(accounts_payable_value) * money_scale
+
+    stockholders_equity_value = _current_value(["Stockholders' equity"], expected_count=2)
+    noncontrolling_value = _current_value(["Non-controlling interests"], expected_count=2)
+    if stockholders_equity_value is not None or noncontrolling_value is not None:
+        metrics["equity"] = (abs(stockholders_equity_value or 0.0) + abs(noncontrolling_value or 0.0)) * money_scale
+    elif metrics.get("total_assets") is not None and metrics.get("total_liabilities") is not None:
+        metrics["equity"] = metrics["total_assets"] - metrics["total_liabilities"]
+
+    _assign_money("cash", ["Cash and cash equivalents"], expected_count=3)
+    _assign_money("accounts_receivable", ["Trade accounts receivable"], expected_count=2)
+
+    metrics["interest_income"] = None
+
+    return metrics
+
+
 def _apply_bank_like_6k_metrics(
     report: FilingReport,
     raw: str,
@@ -3261,6 +4341,55 @@ def _apply_bank_like_6k_metrics(
         )
         if shares_outstanding_row:
             report.shares_outstanding = shares_outstanding_row[0] * 1_000_000
+
+    preview_norm = _normalize_label(" ".join(lines[:300]))
+    if "grupo cibest" in preview_norm and report.currency_unit == "COP, millions":
+        revenue_components = [
+            _extract_cib_summary_current_value(lines, ["Net interest income"]),
+            _extract_cib_summary_current_value(lines, ["Fees and income from service, net"]),
+            _extract_cib_summary_current_value(lines, ["Other operating income"]),
+            _extract_cib_summary_current_value(lines, ["Total Dividends received and equity method"]),
+        ]
+        if all(value is not None for value in revenue_components):
+            report.revenue = sum(revenue_components) * bank_multiplier
+        report.operating_income = None
+        pretax_value = _extract_cib_summary_current_value(
+            lines,
+            ["Profit from continuing operations before income tax"],
+        )
+        if pretax_value is not None:
+            report.pretax_income = pretax_value * bank_multiplier
+        tax_value = _extract_cib_summary_current_value(
+            lines,
+            ["Income tax on continuing operations and taxes on prior periods of continuing operations"],
+            prefer_abs=True,
+        )
+        if tax_value is not None:
+            report.tax_expense = tax_value * bank_multiplier
+        net_income_value = _extract_cib_summary_current_value(
+            lines,
+            ["Net income attributable to equity holders of the Parent Company"],
+        )
+        if net_income_value is None:
+            net_income_value = _extract_cib_summary_current_value(lines, ["Net income"])
+        if net_income_value is not None:
+            report.net_income = net_income_value * bank_multiplier
+        assets_value = _extract_cib_summary_current_value(lines, ["Total assets"])
+        if assets_value is not None:
+            report.total_assets = assets_value * bank_multiplier
+        liabilities_value = _extract_cib_summary_current_value(lines, ["Total liabilities"])
+        if liabilities_value is not None:
+            report.total_liabilities = liabilities_value * bank_multiplier
+        equity_value = _extract_cib_summary_current_value(
+            lines,
+            ["Shareholders' equity", "Shareholders’ equity"],
+            exact=True,
+        )
+        if equity_value is not None:
+            report.equity = equity_value * bank_multiplier
+        interest_income_value = _extract_cib_summary_current_value(lines, ["Interest income"])
+        if interest_income_value is not None:
+            report.interest_income = interest_income_value * bank_multiplier
 
 def _capture_report_metric_candidates(
     report: FilingReport,
@@ -5495,7 +6624,7 @@ def _extract_balance_sheet_metrics_6k(lines: list[str], currency_unit: str | Non
         ),
         "assets_current": _find_row_value(
             rows,
-            ["total current assets"],
+            ["total current assets", "current assets subtotal"],
             prefer_non_usd_current=prefer_non_usd_current,
             current_period_first=current_period_first,
             has_note_column=has_note_column,
@@ -5510,7 +6639,7 @@ def _extract_balance_sheet_metrics_6k(lines: list[str], currency_unit: str | Non
         ),
         "liabilities_current": _find_row_value(
             rows,
-            ["total current liabilities"],
+            ["total current liabilities", "current liabilities subtotal"],
             prefer_non_usd_current=prefer_non_usd_current,
             current_period_first=current_period_first,
             has_note_column=has_note_column,
@@ -5591,14 +6720,22 @@ def _extract_balance_sheet_metrics_6k(lines: list[str], currency_unit: str | Non
     }
     row_presence_by_metric = {
         "total_assets": any("total assets" in _normalize_label(label) for label, _ in rows),
-        "assets_current": any("total current assets" in _normalize_label(label) for label, _ in rows),
+        "assets_current": any(
+            target in _normalize_label(label)
+            for label, _ in rows
+            for target in ("total current assets", "current assets subtotal")
+        ),
         "total_liabilities": any(
             "total liabilities" in _normalize_label(label)
             and "equity" not in _normalize_label(label)
             and "participation interest" not in _normalize_label(label)
             for label, _ in rows
         ),
-        "liabilities_current": any("total current liabilities" in _normalize_label(label) for label, _ in rows),
+        "liabilities_current": any(
+            target in _normalize_label(label)
+            for label, _ in rows
+            for target in ("total current liabilities", "current liabilities subtotal")
+        ),
         "equity": any(
             target in _normalize_label(label)
             for label, _ in rows
@@ -7406,6 +8543,14 @@ def _apply_6k_metrics(
     ):
         report.currency_unit = "JPY, millions"
 
+    split_q4_fy_metrics = _extract_split_q4_fy_html_metrics_6k(
+        raw,
+        ordinary_shares_per_depositary_share,
+    )
+    for metric, value in split_q4_fy_metrics.items():
+        if value is not None:
+            setattr(report, metric, value)
+
     reconciliation_sbc = _extract_share_based_compensation_6k(lines, currency_unit)
     if reconciliation_sbc is not None:
         report.share_based_compensation = reconciliation_sbc
@@ -7516,6 +8661,79 @@ def _apply_6k_metrics(
             and abs(implied_diluted) > max(abs(report.eps_diluted) * 2.0, 1.0)
         ):
             report.eps_diluted = round(implied_diluted, 2)
+
+    split_eps_basic = split_q4_fy_metrics.get("eps_basic")
+    split_eps_diluted = split_q4_fy_metrics.get("eps_diluted")
+    if split_eps_basic is not None:
+        report.eps_basic = split_eps_basic
+    if split_eps_diluted is not None:
+        report.eps_diluted = split_eps_diluted
+
+    wpm_like_metrics = _extract_wpm_like_metrics_6k(raw, ordinary_shares_per_depositary_share)
+    for metric, value in wpm_like_metrics.items():
+        if value is not None:
+            setattr(report, metric, value)
+
+    here_like_metrics = _extract_here_like_metrics_6k(
+        raw,
+        ordinary_shares_per_depositary_share,
+    )
+    for metric, value in here_like_metrics.items():
+        if value is not None:
+            setattr(report, metric, value)
+
+    roma_like_metrics = _extract_roma_like_metrics_6k(
+        raw,
+        ordinary_shares_per_depositary_share,
+    )
+    if roma_like_metrics:
+        report.currency_unit = "HKD"
+        for metric in (
+            "tax_expense",
+            "research_and_development",
+            "selling_and_marketing",
+            "general_and_administrative",
+            "share_based_compensation",
+            "ebitda",
+            "retained_earnings",
+            "capex",
+            "acquisitions",
+        ):
+            setattr(report, metric, None)
+    for metric, value in roma_like_metrics.items():
+        if value is not None:
+            setattr(report, metric, value)
+
+    wit_like_metrics = _extract_wit_like_metrics_6k(raw)
+    if wit_like_metrics:
+        report.currency_unit = "INR, millions"
+    for metric, value in wit_like_metrics.items():
+        if value is not None:
+            setattr(report, metric, value)
+
+    holo_like_metrics = _extract_holo_like_metrics_6k(raw)
+    if holo_like_metrics:
+        report.currency_unit = "CNY"
+        for metric in ("interest_income", "ebitda", "capex", "acquisitions"):
+            setattr(report, metric, None)
+    for metric, value in holo_like_metrics.items():
+        if value is not None:
+            setattr(report, metric, value)
+
+    wimi_like_share_metrics = _extract_wimi_like_share_metrics_6k(raw)
+    for metric, value in wimi_like_share_metrics.items():
+        if value is not None:
+            setattr(report, metric, value)
+
+    tk_like_metrics = _extract_tk_like_metrics_6k(raw)
+    for metric, value in tk_like_metrics.items():
+        if value is not None:
+            setattr(report, metric, value)
+
+    glng_like_metrics = _extract_glng_like_metrics_6k(raw)
+    for metric, value in glng_like_metrics.items():
+        if value is not None:
+            setattr(report, metric, value)
 
 
 def _safe_ratio(numerator: float | None, denominator: float | None) -> float | None:
@@ -7805,7 +9023,7 @@ def parse_filing(path: Path) -> FilingReport | None:
                     )
                     if explicit_shares is not None:
                         reference_shares = report.weighted_avg_shares_basic or report.shares_outstanding
-                        if reference_shares is None or (0.5 <= explicit_shares / reference_shares <= 1.5):
+                        if reference_shares in (None, 0) or (0.5 <= explicit_shares / reference_shares <= 1.5):
                             report.shares_outstanding = explicit_shares
                     weighted_basic, weighted_diluted = _extract_weighted_shares_from_text(
                         share_source_lines,
@@ -7817,11 +9035,33 @@ def parse_filing(path: Path) -> FilingReport | None:
                     if report.weighted_avg_shares_diluted is None and weighted_diluted is not None:
                         report.weighted_avg_shares_diluted = weighted_diluted
 
+                wit_like_metrics = _extract_wit_like_metrics_6k(raw)
+                if wit_like_metrics:
+                    report.currency_unit = "INR, millions"
+                    for metric, value in wit_like_metrics.items():
+                        if value is not None:
+                            setattr(report, metric, value)
+
+                wimi_like_share_metrics = _extract_wimi_like_share_metrics_6k(raw)
+                for metric, value in wimi_like_share_metrics.items():
+                    if value is not None:
+                        setattr(report, metric, value)
+
+                tk_like_metrics = _extract_tk_like_metrics_6k(raw)
+                for metric, value in tk_like_metrics.items():
+                    if value is not None:
+                        setattr(report, metric, value)
+
         if form_type == "20-F":
             _apply_20f_operations_statement_fallbacks(report, lines, currency_unit)
 
     _maybe_correct_duplicate_thousand_scale_annual_report(report, lines, statement_currency_unit)
     _finalize_report(report)
+    if form_type == "6-K":
+        tk_like_metrics = _extract_tk_like_metrics_6k(raw)
+        for metric, value in tk_like_metrics.items():
+            if value is not None:
+                setattr(report, metric, value)
     return report
 
 
@@ -7829,12 +9069,26 @@ def _parse_filing_path(path_str: str) -> FilingReport | None:
     return parse_filing(Path(path_str))
 
 
-def _scan_candidate_paths(directory: Path) -> list[Path]:
-    return [
+def _is_warrant_like_filing_path(path: Path) -> bool:
+    ticker = path.parent.name.upper()
+    if not ticker.endswith(WARRANT_LIKE_TICKER_SUFFIXES):
+        return False
+    try:
+        preview = path.read_text(encoding="utf-8", errors="ignore")[:50000].lower()
+    except OSError:
+        return False
+    return any(keyword in preview for keyword in WARRANT_LIKE_KEYWORDS)
+
+
+def _scan_candidate_paths(directory: Path, *, skip_warrant_like: bool = False) -> list[Path]:
+    candidate_paths = [
         path
         for path in sorted(directory.rglob("*"))
         if path.is_file() and path.suffix.lower() in TEXT_EXTENSIONS
     ]
+    if skip_warrant_like:
+        candidate_paths = [path for path in candidate_paths if not _is_warrant_like_filing_path(path)]
+    return candidate_paths
 
 
 def _resolve_scan_workers(workers: int | None) -> int:
@@ -7963,8 +9217,9 @@ def scan_directory(
     progress_every: int = DEFAULT_PROGRESS_EVERY,
     progress_stream: TextIO | None = None,
     file_timeout_seconds: float | None = DEFAULT_FILE_TIMEOUT_SECONDS,
+    skip_warrant_like: bool = False,
 ) -> list[FilingReport]:
-    candidate_paths = _scan_candidate_paths(directory)
+    candidate_paths = _scan_candidate_paths(directory, skip_warrant_like=skip_warrant_like)
     if not candidate_paths:
         return []
 
@@ -8295,6 +9550,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_FILE_TIMEOUT_SECONDS,
         help="Skip a file if parsing exceeds this many seconds. Use 0 to disable.",
     )
+    parser.add_argument(
+        "--skip-warrant-like",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip warrant-like tickers such as AUROW during directory scans.",
+    )
     parser.add_argument("--explain-forms", action="store_true", help="Print form type explanations and exit.")
     return parser
 
@@ -8326,6 +9587,7 @@ def main() -> int:
         show_progress=args.progress,
         progress_every=args.progress_every,
         file_timeout_seconds=args.file_timeout_seconds,
+        skip_warrant_like=args.skip_warrant_like,
     )
     if args.latest_per_ticker_form:
         reports = _latest_per_ticker_form(reports)

@@ -205,6 +205,13 @@ def _apply_financial_like_periodic_overrides(base, report, lines: list[str]) -> 
             if gap > tolerance:
                 report.equity = derived_equity
 
+    if (
+        report.assets_current is not None
+        and report.total_assets is not None
+        and report.assets_current > report.total_assets * 1.05
+    ):
+        report.assets_current = None
+
 
 def _apply_periodic_fallbacks(base, report, facts_by_name, contexts, target_end, lines: list[str]) -> None:
     if report.interest_income is not None and report.interest_income < 0:
@@ -303,6 +310,23 @@ def _finalize_periodic_report(base, report) -> None:
         and report.shares_outstanding < report.weighted_avg_shares_basic * 0.2
     ):
         report.shares_outstanding = report.weighted_avg_shares_basic
+
+    if report.total_assets is not None and report.equity is not None:
+        derived_liabilities = report.total_assets - report.equity
+        if derived_liabilities > 0:
+            if report.total_liabilities is None:
+                report.total_liabilities = derived_liabilities
+            else:
+                liabilities_too_small_for_current = (
+                    report.liabilities_current is not None and report.total_liabilities < report.liabilities_current * 0.9
+                )
+                liabilities_implausibly_small = (
+                    report.total_assets > 0 and report.total_liabilities < report.total_assets * 0.1
+                )
+                gap = abs(report.total_liabilities - derived_liabilities)
+                tolerance = max(1.0, abs(derived_liabilities) * 0.2)
+                if (liabilities_too_small_for_current or liabilities_implausibly_small) and gap > tolerance:
+                    report.total_liabilities = derived_liabilities
 
     if report.equity is None and report.total_assets is not None and report.total_liabilities is not None:
         report.equity = report.total_assets - report.total_liabilities
